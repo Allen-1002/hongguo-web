@@ -239,7 +239,7 @@ Chrome/Edge 地址栏右侧会出现「安装」；手机浏览器「添加到�
 - **本地构建**：装好 JDK 17、Android SDK（NDK 27.2、CMake 3.22.1）后：
 
   ```bash
-  (cd server && pnpm install --prod --frozen-lockfile)
+  (cd server && pnpm install --prod --frozen-lockfile --config.node-linker=hoisted)
   android/scripts/fetch-libnode.sh
   gradle -p android assembleRelease     # 产物：android/app/build/outputs/apk/release/
   ```

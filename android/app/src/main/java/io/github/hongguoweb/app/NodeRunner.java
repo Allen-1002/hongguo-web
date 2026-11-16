@@ -77,7 +77,7 @@ final class NodeRunner {
                 File project = extractIfNeeded(app);
                 File data = new File(app.getFilesDir(), "data");
                 data.mkdirs();
-                String[] args = {"node", new File(project, "server/index.mjs").getAbsolutePath()};
+                String[] args = {"node", new File(project, "server/mobile-boot.cjs").getAbsolutePath()};
                 String[] envs = {
                         "MOBILE=1",
                         "HONGGUO_LOG_FILE=" + CrashLog.nodeLog(app).getAbsolutePath(),
@@ -138,7 +138,7 @@ final class NodeRunner {
         PackageInfo pi = ctx.getPackageManager().getPackageInfo(ctx.getPackageName(), 0);
         String stamp = pi.versionCode + "-" + pi.lastUpdateTime;
         SharedPreferences sp = ctx.getSharedPreferences("node", Context.MODE_PRIVATE);
-        if (stamp.equals(sp.getString("extracted", "")) && new File(dir, "server/index.mjs").exists()) return dir;
+        if (stamp.equals(sp.getString("extracted", "")) && new File(dir, "server/mobile-boot.cjs").exists()) return dir;
 
         deleteRecursive(dir);
         dir.mkdirs();

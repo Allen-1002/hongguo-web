@@ -37,11 +37,15 @@ jobs:
           npx -y node@18.20.4 server/selftest.mjs
           rm -rf server/node_modules
 
-      - name: Install server deps (production)
+      # 必须是平铺的 node_modules：pnpm 默认用符号链接，打进 zip 后链接变成普通目录，
+      # axios 的依赖（form-data 等）就找不到了，App 一启动 Node 就退出（真机实测）。
+      - name: Install server deps (production, hoisted)
         run: |
           set -eu
           corepack enable
-          cd server && pnpm install --prod --frozen-lockfile
+          cd server && pnpm install --prod --frozen-lockfile --config.node-linker=hoisted
+          test -f node_modules/form-data/package.json
+          test -z "$(find node_modules -type l -not -path '*/.bin/*' | head -1)" || { echo "node_modules 里还有符号链接"; find node_modules -type l | head; exit 1; }
 
       - name: Cache nodejs-mobile
         uses: actions/cache@v4
@@ -92,6 +96,27 @@ jobs:
           # 确认原生库和 Node 项目都打进去了（缺 libc++_shared.so / libnode.so 会一启动就闪退）
           unzip -l "$out" | grep -E "lib/|assets/" 
           echo "file=$out" >> "$GITHUB_OUTPUT"
+
+      # 用和手机一样的 Node 18，从 APK 里解出的 nodejs-project 真启动一次手机模式，确认能起来。
+      - name: Boot bundled server on Node 18 (smoke)
+        run: |
+          set -eu
+          dir="$RUNNER_TEMP/bundle"
+          mkdir -p "$dir"
+          unzip -q -p "${{ steps.apk.outputs.file }}" assets/nodejs-project.zip > "$RUNNER_TEMP/project.zip"
+          unzip -q "$RUNNER_TEMP/project.zip" -d "$dir"
+          MOBILE=1 PORT=38799 TOKEN=ci DATA_DIR="$RUNNER_TEMP/data" SOURCES_DIR="$dir/sources/builtin" \
+            HONGGUO_LOG_FILE="$RUNNER_TEMP/node.log" \
+            npx -y node@18.20.4 "$dir/server/mobile-boot.cjs" &
+          pid=$!
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:38799/health > "$RUNNER_TEMP/health.json" 2>/dev/null; then break; fi
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/health.json" || true; echo
+          cat "$RUNNER_TEMP/node.log" || true
+          kill $pid || true
+          grep -q '"mobile":true' "$RUNNER_TEMP/health.json"
 
       - uses: actions/upload-artifact@v4
         with:

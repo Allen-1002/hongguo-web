@@ -101,8 +101,9 @@ def packNodeProject = tasks.register("packNodeProject", Zip) {
     from(new File(root, "sources")) { into "sources" }
     from(new File(root, "web")) { into "web" }
     doFirst {
-        if (!new File(root, "server/node_modules/axios").exists())
-            throw new GradleException("先在 server/ 里装好依赖：cd server && pnpm install --prod --frozen-lockfile")
+        // 必须是平铺结构（hoisted）：pnpm 默认的符号链接打进 zip 会变成普通目录，axios 的依赖就找不到了。
+        if (!new File(root, "server/node_modules/form-data/package.json").exists())
+            throw new GradleException("先在 server/ 里装好平铺的依赖：cd server && pnpm install --prod --frozen-lockfile --config.node-linker=hoisted")
         if (!new File(libnodeDir, "bin/arm64-v8a/libnode.so").exists())
             throw new GradleException("缺少 nodejs-mobile：先运行 android/scripts/fetch-libnode.sh")
     }
