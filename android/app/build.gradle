@@ -1,0 +1,110 @@
+import groovy.json.JsonSlurper
+
+plugins {
+    id "com.android.application"
+}
+
+// 版本号跟随服务端 package.json，App 与 Docker 镜像同一个版本。
+def serverPkg = new JsonSlurper().parse(file("../../server/package.json"))
+def appVersionName = serverPkg.version
+def appVersionCode = (System.getenv("VERSION_CODE") ?: "1") as int
+
+// nodejs-mobile 预编译库（libnode.so + 头文件），由 scripts/fetch-libnode.sh 下载到这里。
+def libnodeDir = file("libnode")
+
+android {
+    namespace "io.github.hongguoweb.app"
+    compileSdk 35
+    ndkVersion "27.2.12479018"
+
+    defaultConfig {
+        applicationId "io.github.hongguoweb.app"
+        minSdk 24
+        targetSdk 35
+        versionCode appVersionCode
+        versionName appVersionName
+        ndk {
+            // 只打 64 位 ARM：近几年的安卓手机都是 arm64，包体能小一半。
+            abiFilters "arm64-v8a"
+        }
+        externalNativeBuild {
+            cmake {
+                arguments "-DANDROID_STL=c++_shared", "-DLIBNODE_DIR=" + libnodeDir.absolutePath
+                cppFlags "-std=c++17"
+            }
+        }
+    }
+
+    // 签名：CI 里有 ANDROID_KEYSTORE_* 时用正式签名；否则用调试签名（自己装没问题，只是换签名要先卸载）。
+    signingConfigs {
+        release {
+            def ks = System.getenv("ANDROID_KEYSTORE_FILE")
+            if (ks) {
+                storeFile file(ks)
+                storePassword System.getenv("ANDROID_KEYSTORE_PASSWORD")
+                keyAlias System.getenv("ANDROID_KEY_ALIAS")
+                keyPassword System.getenv("ANDROID_KEY_PASSWORD")
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig System.getenv("ANDROID_KEYSTORE_FILE") ? signingConfigs.release : signingConfigs.debug
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path "src/main/cpp/CMakeLists.txt"
+            version "3.22.1"
+        }
+    }
+
+    sourceSets {
+        main {
+            jniLibs.srcDirs = [new File(libnodeDir, "bin")]
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    lint {
+        // 自用 App：lint 只提示，不拦打包。
+        checkReleaseBuilds false
+        abortOnError false
+    }
+
+    packaging {
+        jniLibs {
+            // libnode.so 很大，保持不压缩 + 页对齐，安装后直接 mmap。
+            useLegacyPackaging false
+        }
+    }
+}
+
+// 把服务端（含 node_modules）、内置源、前端打成一个 zip 放进 assets；
+// 首次启动或升级后由 App 解压到私有目录再交给内嵌 Node 运行。
+// 用单个 zip 而不是散文件：aapt 会悄悄丢掉以 . 或 _ 开头的文件，node_modules 里有这种文件。
+def packNodeProject = tasks.register("packNodeProject", Zip) {
+    def root = file("../..")
+    archiveFileName = "nodejs-project.zip"
+    destinationDirectory = file("src/main/assets")
+    from(new File(root, "server")) {
+        into "server"
+        exclude "data/**", "selftest.mjs", "scripts/**"
+    }
+    from(new File(root, "sources")) { into "sources" }
+    from(new File(root, "web")) { into "web" }
+    doFirst {
+        if (!new File(root, "server/node_modules/axios").exists())
+            throw new GradleException("先在 server/ 里装好依赖：cd server && pnpm install --prod --frozen-lockfile")
+        if (!new File(libnodeDir, "bin/arm64-v8a/libnode.so").exists())
+            throw new GradleException("缺少 nodejs-mobile：先运行 android/scripts/fetch-libnode.sh")
+    }
+}
+tasks.named("preBuild") { dependsOn packNodeProject }

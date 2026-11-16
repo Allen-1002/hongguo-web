@@ -1,0 +1,10 @@
+.gradle/
+build/
+app/build/
+app/.cxx/
+local.properties
+# CI 下载的 nodejs-mobile 预编译库与打包好的 Node 项目，不入库
+app/libnode/
+app/src/main/assets/
+*.keystore
+*.jks

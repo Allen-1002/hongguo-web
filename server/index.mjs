@@ -7,14 +7,17 @@ import { createCatalog } from "./catalog.mjs";
 import { createServer } from "./http.mjs";
 import { createMonitor } from "./monitor.mjs";
 import { createRecommend } from "./recommend.mjs";
-import { openDb } from "./db.mjs";
 import { UserStore } from "./users.mjs";
+import { LocalUserStore } from "./local-store.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const { version } = JSON.parse(fs.readFileSync(new URL("./package.json", import.meta.url), "utf8"));
 
+// 手机 App 模式：Node 跑在手机 App 进程里（nodejs-mobile，Node 18），只给本机 WebView 用。
+// 账号改为本机单用户 JSON 存储，关掉服务器运维类功能（通道探针、Webhook、ffmpeg 转码）。
+const MOBILE = process.env.MOBILE === "1";
 const PORT = Number(process.env.PORT || 8787);
-const HOST = process.env.HOST || "0.0.0.0";
+const HOST = process.env.HOST || (MOBILE ? "127.0.0.1" : "0.0.0.0");
 const DATA_DIR = process.env.DATA_DIR || path.join(ROOT, "data");
 const BUILTIN_DIR = process.env.SOURCES_DIR || path.join(ROOT, "sources", "builtin");
 const TOKEN = process.env.TOKEN || "";
@@ -26,7 +29,7 @@ const updateStartDelaySeconds = Number(process.env.SOURCE_UPDATE_START_DELAY_SEC
 const SOURCE_UPDATE_START_DELAY_SECONDS = Number.isFinite(updateStartDelaySeconds) && updateStartDelaySeconds >= 0 ? updateStartDelaySeconds : 15;
 
 // 播放通道监控：定时深探针 + 状态翻转告警（可选 webhook），默认开启、10 分钟一轮。
-const PLAYBACK_MONITOR = process.env.PLAYBACK_MONITOR !== "0";
+const PLAYBACK_MONITOR = !MOBILE && process.env.PLAYBACK_MONITOR !== "0";
 const monitorMinutes = Number(process.env.PLAYBACK_MONITOR_INTERVAL_MINUTES);
 const PLAYBACK_MONITOR_INTERVAL_MINUTES = Number.isFinite(monitorMinutes) && monitorMinutes >= 1 ? monitorMinutes : 10;
 const alertThreshold = Number(process.env.PLAYBACK_ALERT_THRESHOLD);
@@ -40,7 +43,7 @@ if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
 
 // 源导入会把脚本送进 vm 执行：没口令时它只对内网来源开放（见 http.mjs ADMIN_WRITE）。
 // 这里把「当前处于无口令模式」明确写进启动日志，避免部署者以为默认就有访问控制。
-if (!TOKEN) {
+if (!TOKEN && !MOBILE) {
   console.warn(JSON.stringify({
     event: "no_access_token",
     message: "未设置 TOKEN：管理接口（源导入/清缓存）仅接受内网来源；对外网开放请设置 TOKEN",
@@ -59,8 +62,16 @@ const monitor = PLAYBACK_MONITOR
     version,
   })
   : null;
-const db = openDb(DATA_DIR);
-const users = new UserStore(db);
+// node:sqlite 只在 Node 22.5+ 存在，按需加载，手机模式（Node 18）不会碰到它。
+let db = null;
+let users;
+if (MOBILE) {
+  users = new LocalUserStore(DATA_DIR);
+} else {
+  const { openDb } = await import("./db.mjs");
+  db = openDb(DATA_DIR);
+  users = new UserStore(db);
+}
 const recommend = createRecommend({ catalog, users, sources });
 const server = createServer({
   provider,
@@ -72,6 +83,7 @@ const server = createServer({
   webDir: path.join(ROOT, "web"),
   token: TOKEN,
   version,
+  mobile: MOBILE,
   maxStreams: Number.isInteger(MAX_STREAMS) && MAX_STREAMS > 0 ? MAX_STREAMS : 6,
 });
 
@@ -122,7 +134,8 @@ function shutdown(signal) {
   try { if (monitor) monitor.stop(); } catch {}
   try { sources.close(); } catch {}
   server.close(() => {
-    try { db.close(); } catch {}
+    try { if (db) db.close(); } catch {}
+    try { if (users && typeof users.close === "function") users.close(); } catch {}
     process.exit(0);
   });
   // 兜底：长连接（正在播放的流）不阻塞退出

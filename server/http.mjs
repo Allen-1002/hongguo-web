@@ -134,7 +134,7 @@ function rateLimit(req) {
 const FORCE_COOLDOWN_MS = 60 * 1000;
 const FOLLOW_DUE_MAX = 20;
 
-export function createServer({ provider, sources, catalog, users = null, monitor = null, recommend = null, webDir, token = "", version = "0.0.0", maxStreams = 6 }) {
+export function createServer({ provider, sources, catalog, users = null, monitor = null, recommend = null, webDir, token = "", version = "0.0.0", mobile = false, maxStreams = 6 }) {
   const forceCheckedAt = new Map();
   const serveStatic = createStaticHandler(webDir);
   const serveStream = createStreamHandler({ provider, limit: maxStreams });
@@ -162,6 +162,7 @@ export function createServer({ provider, sources, catalog, users = null, monitor
         active: sources.activeId,
         sources: sources.list().sources.length,
         accounts: Boolean(users),
+        mobile,
       })],
 
     ["GET", /^\/api\/metrics$/, ({ json }) =>
@@ -310,6 +311,18 @@ export function createServer({ provider, sources, catalog, users = null, monitor
       const u = requireUser(ctx);
       const body = parseJsonBody(await readBody(ctx.req));
       return ctx.json(200, { ok: true, prefs: users.setPrefs(u.id, body) });
+    }],
+
+    // ---- 我的数据：备份导出 / 导入（手机 App 模式没有云同步，靠它换机或重装后恢复） ----
+    ["GET", /^\/api\/me\/backup$/, (ctx) => {
+      requireUser(ctx);
+      if (!users || typeof users.exportData !== "function") throw fail("NOT_FOUND", "当前模式不支持备份");
+      return ctx.json(200, users.exportData());
+    }],
+    ["POST", /^\/api\/me\/backup$/, async (ctx) => {
+      requireUser(ctx);
+      if (!users || typeof users.importData !== "function") throw fail("NOT_FOUND", "当前模式不支持备份");
+      return ctx.json(200, users.importData(parseJsonBody(await readBody(ctx.req))));
     }],
 
     // ---- 猜你喜欢（基于观看历史的推荐；登录用服务端历史，未登录用本地历史兜底） ----

@@ -28,6 +28,8 @@ import {
   reportReject,
 } from "./breaker.mjs";
 import { fail, headersOf, publicMessage, statusOf } from "./errors.mjs";
+import { LocalUserStore } from "./local-store.mjs";
+import os from "node:os";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
@@ -482,6 +484,37 @@ eq(coded.message, "剧集不存在", "fail 保留消息");
 eq(publicMessage(coded), "剧集不存在", "有业务码时对外透出自身文案");
 eq(publicMessage(fail("UPSTREAM", "")), "内容源暂不可用，请稍后重试", "空消息回落通用文案");
 eq(publicMessage(new Error("内部细节")), "内容源暂不可用，请稍后重试", "无业务码时只给通用文案");
+
+// ------------------------------------------------------------------- 手机模式本地存储（LocalUserStore）
+
+section("LocalUserStore（手机 App 模式的本机数据）");
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hg-local-"));
+  const store = new LocalUserStore(dir);
+  ok(store.auth("") === null, "空令牌不认");
+  eq(store.auth("anything").id, 1, "任意非空令牌即本机用户");
+  store.putHistory(1, { source: "s", id: "a", title: "A", pos: 10, at: 2000 });
+  store.putHistory(1, { source: "s", id: "a", title: "A", pos: 5, at: 1000 });
+  eq(store.listHistory(1)[0].pos, 10, "旧进度不覆盖新进度");
+  store.addFavorite(1, { source: "s", id: "a", title: "A" });
+  store.addFollow(1, { source: "s", id: "a", title: "A" });
+  store.touchFollow(1, "s", "a", 12);
+  eq(store.listFollows(1)[0].epCount, 12, "追更集数可更新");
+  eq(store.setPrefs(1, { rate: 1.5 }).rate, 1.5, "倍速可保存");
+  store.flush();
+  const again = new LocalUserStore(dir);
+  eq(again.listHistory(1).length, 1, "重启后历史仍在");
+  eq(again.listFavorites(1).length, 1, "重启后收藏仍在");
+  eq(again.getPrefs(1).rate, 1.5, "重启后倍速仍在");
+  const backup = again.exportData();
+  const fresh = new LocalUserStore(fs.mkdtempSync(path.join(os.tmpdir(), "hg-local-")));
+  const res = fresh.importData(backup);
+  eq(res.counts.history, 1, "备份可导入历史");
+  eq(fresh.listFollows(1).length, 1, "备份可导入追更");
+  let threw = false;
+  try { fresh.setPrefs(1, { rate: 3 }); } catch (e) { threw = e.code === "BAD_INPUT"; }
+  ok(threw, "非法倍速被拒");
+}
 
 // ------------------------------------------------------------------- 汇总
 
