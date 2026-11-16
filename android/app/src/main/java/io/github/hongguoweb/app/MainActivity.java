@@ -110,7 +110,8 @@ public class MainActivity extends Activity {
         });
 
         chrome = new WebChromeClient() {
-            // 页面里的 requestFullscreen()（播放器全屏按钮 / 双击）走这里：铺满屏幕并横屏。
+            // 页面里的 requestFullscreen()（播放器全屏按钮 / 双击）走这里：铺满屏幕。
+            // 短剧多是竖版视频：只有视频本身是横版时才转横屏，且用 USER_LANDSCAPE（尊重系统的方向锁定，不跟着陀螺仪乱转）。
             @Override
             public void onShowCustomView(View view, CustomViewCallback callback) {
                 if (fullView != null) { callback.onCustomViewHidden(); return; }
@@ -118,7 +119,12 @@ public class MainActivity extends Activity {
                 fullCallback = callback;
                 root.addView(view, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
                 setFullscreenBars(true);
-                setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
+                web.evaluateJavascript(
+                        "(function(){var v=document.querySelector('video');return v&&v.videoWidth>v.videoHeight?1:0})()",
+                        value -> {
+                            if (fullView != null && "1".equals(value))
+                                setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_USER_LANDSCAPE);
+                        });
             }
 
             @Override
@@ -129,7 +135,7 @@ public class MainActivity extends Activity {
                 if (fullCallback != null) fullCallback.onCustomViewHidden();
                 fullCallback = null;
                 setFullscreenBars(false);
-                setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED);
+                setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_PORTRAIT);
             }
 
             // <input type="file">（导入备份、导入源文件）。
