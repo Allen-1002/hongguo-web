@@ -655,7 +655,7 @@ const BREAKERS = { official: createBreaker("official"), compat: createBreaker("c
 // 只有「上游在明确拒绝我们」的失败才熔断：空正文、签名失效、风控、403/429。
 // DNS 抖动、TLS 断连属于网络瞬态，交给 stream() 里的单次重试，不该拉闸。
 const UPSTREAM_REJECT =
-  /空响应|video_model|video_tab|device_register|web 播放|风控|HTTP 40[13]|HTTP 429/i;
+  /空响应|video_model|video_tab|device_register|web 播放|风控|冷却中|HTTP 40[13]|HTTP 429/i;
 
 function isUpstreamRejection(message) {
   return UPSTREAM_REJECT.test(String(message || ""));

@@ -1,19 +1,28 @@
-import crypto from "node:crypto";
 import path from "node:path";
 import axios from "axios";
-import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { createDeviceStore } from "./device.mjs";
 
-const require = createRequire(import.meta.url);
-const { PlayerSigner } = require("./sign/argus.cjs");
-
 // 红果（番茄小说 App，aid=8662）官方播放模型接口。
-// 只有 multi_video_model 这条稳定可用；video_model / video_tab 均已返回 200 空正文。
+//
+// 2026-11 上游变化（实测，别再改回带签名的请求）：
+//   1) POST /novel/player/multi_video_model/v1/ 带全套签名头 → 200 + 0 字节；
+//   2) GET  /reading/bookapi/video_tab/multi_video_model/v1/ 带全套签名头 → 200 + 0 字节；
+//   3) 同一批接口去掉全部签名头、只带「平台注册的匿名设备身份」→ 曾返回完整模型（21KB，含多档片源）。
+// 即 sign/argus.cjs 生成的 x-argus/x-ladon 已不被上游接受，带上反而被判成伪造客户端，
+// 所以这里一律发「无签名 + 注册身份」的请求。
+// 代价是该通道对同一出口 IP 有很强的限流惩罚窗（连续取址稳定回 0 字节），
+// 因此策略是：每次取址只打一发，空响应后全局冷却，绝不重试轰炸。
 const MODEL_HOST = "https://api5-normal-sinfonlinea.fqnovel.com";
 const MODEL_PATH = "/novel/player/multi_video_model/v1/";
 
-// 请求头：仅 x-argus + x-ladon 是硬门禁（缺一个就 200 空正文），其余为陪衬。
+// video_tab 是 App 播放页真正使用的取址接口（2026-11-10 起 multi_video_model 全族被关）。
+const TAB_HOST = "https://api5-normal-sinfonlineb.fqnovel.com";
+const TAB_PATH = "/reading/bookapi/video_tab/multi_video_model/v1/";
+
+// 空响应后的全局冷却：这段时间内不再打上游，直接让调用方回落 360P 兼容通道。
+const EMPTY_COOLDOWN = 90 * 1000;
+
 const UA =
   "com.phoenix.read/73932 (Linux; U; Android 14; zh_CN; 23127PN0CC; Build/UKQ1.230804.001; " +
   "Cronet/TTNetVersion:04657795 2026-01-23 QuicVersion:c67e9834 2025-09-08)";
@@ -41,6 +50,35 @@ const DEVICE_PARAMS = {
   host_abi: "arm64-v8a",
   dragon_device_type: "phone",
   pv_player: "73932",
+  compliance_status: "0",
+  need_personal_recommend: "1",
+  player_so_load: "1",
+  is_android_pad_screen: "0",
+};
+
+// video_tab 的取址参数照抄 App 播放页（型号/版本与 DEVICE_PARAMS 不同，两者不能混用）。
+const TAB_DEVICE_PARAMS = {
+  ac: "wifi",
+  channel: "update_64",
+  aid: "8662",
+  app_name: "novelread",
+  version_code: "71332",
+  version_name: "7.1.3.32",
+  device_platform: "android",
+  os: "android",
+  ssmix: "a",
+  device_type: "25053RT47C",
+  device_brand: "Redmi",
+  language: "zh",
+  os_api: "36",
+  os_version: "16",
+  manifest_version_code: "71332",
+  resolution: "1280*2772",
+  dpi: "520",
+  update_version_code: "71332",
+  host_abi: "arm64-v8a",
+  dragon_device_type: "phone",
+  pv_player: "71332",
   compliance_status: "0",
   need_personal_recommend: "1",
   player_so_load: "1",
@@ -107,8 +145,14 @@ export function createOfficial({ register, deriveContentKey, devices } = {}) {
     });
 
   const stats = { requests: 0, ok: 0, empty: 0, failed: 0, rotated: 0, lastError: "", lastErrorAt: 0, registered: 0, invalidated: 0 };
+  // 空响应后的全局冷却截止时间（见 EMPTY_COOLDOWN）。
+  let quietUntil = 0;
   // 设备身份现状随 /api/metrics 一起暴露（source / 轮换次数 / 被节流次数），只含脱敏设备号。
   Object.defineProperty(stats, "device", { get: () => store.stats(), enumerable: true });
+  Object.defineProperty(stats, "cooldown", {
+    get: () => ({ active: Date.now() < quietUntil, until: quietUntil }),
+    enumerable: true,
+  });
 
   function markError(error) {
     stats.failed += 1;
@@ -140,32 +184,87 @@ export function createOfficial({ register, deriveContentKey, devices } = {}) {
     return model;
   }
 
+  // video_tab 的响应结构与 multi_video_model 不同：data.video_model_data[epId].video_model。
+  function parseTabModel(text, epId) {
+    const root = JSON.parse(text);
+    if (!root || typeof root !== "object") throw new Error("video_tab 响应不是对象");
+    const code = Number(root.code != null ? root.code : root.Code != null ? root.Code : 0);
+    if (code !== 0) throw new Error("video_tab 返回错误码 " + code);
+    const data = root.data || {};
+    const rows = data.video_model_data || data;
+    const entry = rows && typeof rows === "object" ? rows[String(epId)] : null;
+    if (!entry || typeof entry !== "object") throw new Error("video_tab 响应缺少本集条目");
+    let model = entry.video_model;
+    if (typeof model === "string") model = JSON.parse(model);
+    if (!model || !Array.isArray(model.video_list) || !model.video_list.length)
+      throw new Error("video_tab 没有 video_list");
+    return model;
+  }
+
+  // 主通道：无签名 GET video_tab（注册身份 + 播放页参数）。
+  async function requestTab(epId, options = {}) {
+    const id = await getIdentity(Boolean(options.freshIdentity));
+    const ts = Math.floor(Date.now() / 1000);
+    const query = buildQuery({
+      ...TAB_DEVICE_PARAMS,
+      device_id: id.device_id,
+      iid: id.iid,
+      video_id: String(epId),
+      video_id_type: "0",
+      device_level: "1",
+      need_all_video_definition: "1",
+      need_mp4_align: "0",
+      use_os_player: "0",
+      video_platform: "1024",
+      source: "0",
+      from_video_id: "",
+      ts: String(ts),
+      _rticket: String(ts * 1000),
+    });
+    stats.requests += 1;
+    const resp = await axios.get(TAB_HOST + TAB_PATH + "?" + query, {
+      // 关键：不带任何签名头。带上 x-argus/x-ladon 反而会拿到 200 空正文。
+      headers: {
+        "User-Agent": UA,
+        Accept: "application/json; charset=utf-8,application/x-protobuf",
+      },
+      timeout: MODEL_TIMEOUT,
+      responseType: "text",
+      validateStatus: () => true,
+    });
+    const text = typeof resp.data === "string" ? resp.data : JSON.stringify(resp.data || {});
+    if (resp.status !== 200) throw new Error("video_tab HTTP " + resp.status);
+    if (!text.trim()) {
+      stats.empty += 1;
+      // 空正文 = 出口 IP 已被限流。设全局冷却，避免把惩罚窗越拖越长。
+      quietUntil = Date.now() + EMPTY_COOLDOWN;
+      throw new Error("video_tab 空响应（上游限流）");
+    }
+    return parseTabModel(text, epId);
+  }
+
+  // 备通道：无签名 POST multi_video_model（同样去掉签名头）。
   async function requestModel(epId, options = {}) {
     const id = await getIdentity(Boolean(options.freshIdentity));
     const ts = Math.floor(Date.now() / 1000);
-    const ticket = ts * 1000;
     const query = buildQuery({
       ...DEVICE_PARAMS,
       device_id: id.device_id,
       iid: id.iid,
-      cdid: options.withCdid ? options.withCdid : undefined,
-      openudid: options.withOpenudid ? options.withOpenudid : undefined,
       ts: String(ts),
-      _rticket: String(ticket),
+      _rticket: String(ts * 1000),
     });
     const body = JSON.stringify({
       biz_param: BIZ_PARAM,
       mixed_video_id_map: { 1004: [String(epId)] },
     });
-    const headers = {
-      "User-Agent": UA,
-      Accept: "application/json; charset=utf-8,application/x-protobuf",
-      "Content-Type": "application/json; charset=UTF-8",
-      ...PlayerSigner.headers(query, body, ts),
-    };
     stats.requests += 1;
     const resp = await axios.post(MODEL_HOST + MODEL_PATH + "?" + query, body, {
-      headers,
+      headers: {
+        "User-Agent": UA,
+        Accept: "application/json; charset=utf-8,application/x-protobuf",
+        "Content-Type": "application/json; charset=UTF-8",
+      },
       timeout: MODEL_TIMEOUT,
       responseType: "text",
       validateStatus: () => true,
@@ -174,13 +273,8 @@ export function createOfficial({ register, deriveContentKey, devices } = {}) {
     if (resp.status !== 200) throw new Error("model HTTP " + resp.status);
     if (!text.trim()) {
       stats.empty += 1;
-      // 200 空正文是「这份身份被风控」的典型信号：换一份身份往往立刻恢复。
-      // rotate 内部有 60 秒节流，所以连续失败不会把上游打成「一直在注册」。
-      const rotation = await store.rotate("empty-body");
-      if (rotation.rotated) stats.rotated += 1;
-      throw new Error(
-        "model 空响应（签名或设备身份被风控）" + (rotation.rotated ? "，已换设备身份" : "")
-      );
+      quietUntil = Date.now() + EMPTY_COOLDOWN;
+      throw new Error("model 空响应（上游限流）");
     }
     return parseModel(text, epId);
   }
@@ -208,14 +302,15 @@ export function createOfficial({ register, deriveContentKey, devices } = {}) {
     }
   }
 
+  // 降级顺序：video_tab（缓存身份）→ video_tab（新注册身份）→ 无签名 POST。
+  // 每次取址最多 3 发，空响应即全局冷却；宁可回落 360P，也不把 IP 打进惩罚窗。
+  // 并发合并：/api/play 和 /api/stream 常同时要同一集的 model，合并成一次上游请求，
+  // 也避免「play 侧超时放弃、stream 侧又看到失败缓存」直接掉到 360P。
   async function runFetch(key, options) {
+    if (Date.now() < quietUntil) throw new Error("官方通道冷却中（上次空响应，稍后自动恢复）");
     const attempts = [
-      () => requestModel(key),
-      () =>
-        requestModel(key, {
-          withCdid: crypto.randomUUID(),
-          withOpenudid: crypto.randomBytes(8).toString("hex"),
-        }),
+      () => requestTab(key),
+      () => requestTab(key, { freshIdentity: true }),
       () => requestModel(key, { freshIdentity: true }),
     ];
     let lastError = null;
@@ -227,6 +322,8 @@ export function createOfficial({ register, deriveContentKey, devices } = {}) {
         return model;
       } catch (error) {
         lastError = error;
+        // 进入冷却说明出口 IP 已被限流，再换身份/换接口都是白打。
+        if (Date.now() < quietUntil) break;
         // 网络类错误没必要换身份重试，直接抛给上层回落 360P。
         if (!/空响应|错误码|缺少条目|video_list/.test(String((error && error.message) || error))) break;
       }
