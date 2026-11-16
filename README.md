@@ -161,6 +161,8 @@ docker compose down -v                        # 连数据卷一起删（会丢�
 | `HONGGUO_INSTALL_ID` | 空 | 配合 `HONGGUO_DEVICE_ID` 的 install id（10~20 位纯数字）；只钉 device_id 时由注册补一次 |
 | `FFMPEG_PATH` | `ffmpeg` | 服务端转码用的 ffmpeg 可执行文件。官方镜像已装（`/usr/bin/ffmpeg`，7.1+ 带 VVC 解码）；裸机运行时需自行安装 7.1 以上版本，否则 VVC 高清档不会出现在清晰度菜单 |
 | `TRANSCODE_MAX_INPUT_BYTES` | `100663296` | 单集转码的输入上限（字节，默认 96 MB）；超限直接报错而不是拖垮内存 |
+| `TRANSCODE_MAX_CONCURRENT` | `2` | 同时进行的转码任务上限（VVC → H.264）。超出的请求回 503 `BUSY` |
+| `HLS_TC_TTL_MS` | `1800000` | 转码产物目录的保留时长（毫秒，默认 30 分钟），到期清理 |
 
 ### 2.3 JS 源沙箱
 
@@ -202,7 +204,7 @@ docker compose down -v                        # 连数据卷一起删（会丢�
 - **全屏**：按钮 / 双击画面 / `F`。
 - **下一集预取**：接近结尾时后台预取下一集首段（最多缓存 6 个），点「下一集」秒开。
 - **跨集自动连播**：默认开启，一集播完自动接下一集（按钮「连播 开 / 连播 关」，选择记在本机）。关闭后播完停在当前集并落盘进度；末集只暂停不跳季。播放器会区分「假结束」（时长无效或进度差超过 2 秒）与真片尾——假结束自动恢复当前集且每集只恢复一次，避免吞集或死循环。切到后台标签页、或打开任一弹窗时不自动切集。
-- **红果内置档位**：服务端用 Android App 签名（x-argus + x-ladon）直连官方多档接口，拿 CENC 加密流后服务端解密、按 Range 转发。播放器先探测浏览器 HEVC 解码能力：支持（Safari、装了 HEVC 扩展的 Edge/Chrome、部分安卓）用 1080P，不支持（Chrome/Windows 默认）自动落到 360P H.264 兼容线路，菜单里也可手选。
+- **红果内置档位**：服务端用 Android App 签名（x-argus + x-ladon）直连官方多档接口，拿 CENC 加密流后服务端解密、按 Range 转发。播放器先探测浏览器 HEVC 解码能力：支持（Safari、装了 HEVC 扩展的 Edge/Chrome、部分安卓）用 1080P，不支持（Chrome/Windows 默认）自动落到「本机可播的最高档」——装了 ffmpeg 时是 720P 服务端转码线路，没装才退到 360P H.264 兼容线路；菜单里也可手选。档位清单查询遇到超时/网络抖动会自动再等一次（总预算 9 秒；二次等待次数见 `/api/metrics` 的 `stream.qualityRetries`），避免菜单偶发只剩 360P 兼容档——重试只是接着等同一份在途请求，不会重复打上游。
 
 ### 3.3 播放失败排查
 
@@ -303,7 +305,7 @@ var spider = {
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/health` | 健康检查（含 `accounts` 是否启用账号系统） |
-| GET | `/api/metrics` | 运行指标：uptime、RSS、取流尝试/失败/空响应、熔断（`breakers`）、同集取址去重（`dedupe`）、通道计数（`channels`）、监控快照（`playback`）、`official.device` |
+| GET | `/api/metrics` | 运行指标：uptime、RSS、取流尝试/失败/空响应、熔断（`breakers`）、同集取址去重（`dedupe`）、通道计数（`channels`）、清晰度查询二次等待（`stream.qualityRetries`）、监控快照（`playback`）、转码任务（`transcode` / `hlsTranscode`）、`official.device` |
 | GET | `/api/alerts` | 通道监控快照：`status`（`ok` / `degraded` / `down` / `unknown`）、通道、失败次数、最近告警（最多 50 条） |
 | POST | `/api/alerts/check` | 立即跑一次通道探针（同步返回最新快照） |
 | POST | `/api/cache/clear` | 一键清缓存（排查上游风控/签名变化第一步）：清首页 SWR、推荐池、vendor 四层缓存与官方播放模型缓存，返回各层条目数 |
@@ -338,7 +340,9 @@ var spider = {
 | GET | `/api/play/fallback?source=&id=&index=` | 播放失败时的替代源：按剧名跨源匹配，返回 `{candidates:[{source,name,id,title,episodeCount,targetIndex,episodeName,score}]}`（最多 3 个） |
 | GET | `/api/media?u=&r=&at=` | 媒体透传（支持 Range，`r` 为 Referer）；图片请求（`Accept: image/*` 或图片后缀）上游失败时回内置占位图 **200**，响应头 `x-media-fallback` 标明原因 |
 | GET | `/api/hls?u=&r=&at=` | HLS 清单重写（分片走 `/api/media`，自动带 `at=`；清单内上游鉴权参数用 `st=` 单独传递，不与本站口令混用） |
-| GET/HEAD | `/api/stream/:epId?q=&at=&vvc=` | 内置红果分集流（服务端解密 + Range）；`q` 取 `auto`（最高可播档）/ `1080p`（HEVC）/ `720p` / `540p` / `480p` / `360p` / `compat`（官网 360P H.264 兜底）；响应头 `x-stream-quality`、`x-stream-codec` 标明实际档位与编码。显式点 VVC 档（`q=720p` 等）默认回 **415** `CODEC_UNSUPPORTED`，确需直取时加 `vvc=1`；加 `tc=1` 则由服务端用 ffmpeg 把该 VVC 档**转码成 H.264** 下发（200、`x-stream-transcode:1`、`accept-ranges:none`，可播但不可拖动） |
+| GET/HEAD | `/api/stream/:epId?q=&at=&vvc=` | 内置红果分集流（服务端解密 + Range）；`q` 取 `auto`（最高可播档）/ `1080p`（HEVC）/ `720p` / `540p` / `480p` / `360p` / `compat`（官网 360P H.264 兜底）；响应头 `x-stream-quality`、`x-stream-codec` 标明实际档位与编码。显式点 VVC 档（`q=720p` 等）默认回 **415** `CODEC_UNSUPPORTED`，确需直取时加 `vvc=1`。VVC 档要能播/能拖，走下面的 `/api/tc` 转码清单（`/api/play` 返回的 `quality.options[].url` 已自动指向它） |
+| GET | `/api/tc/:epId/:q/index.m3u8` | 内置红果 VVC 档的**服务端 HLS 转码清单**（fMP4 分片、EVENT）；首个 4 秒分片转好即返回（约 2–6 秒），之后分片随转码追加，转完带 `#EXT-X-ENDLIST`；响应头 `x-stream-transcode:1`、`x-stream-quality`、`x-hls-state`（`running` / `done`） |
+| GET | `/api/tc/:epId/:q/:file` | 转码清单里的 `init.mp4` / `seg_NNNNN.m4s`（支持 Range → 206）；还没转出来的分片回 404，hls.js 会自行重试 |
 
 认证：
 
@@ -369,7 +373,8 @@ hongguo-web/
 │  ├─ media.mjs                     # /api/media 透传（Range）+ /api/hls 清单重写 + 占位图
 │  ├─ stream.mjs                    # /api/stream 内置解密流（Range、并发上限、取址去重）
 │  ├─ mp4.mjs                       # 首块 MP4 盒校验
-│  ├─ transcode.mjs                 # H.266/VVC → H.264 服务端转码（ffmpeg，边转边发、不可拖动）
+│  ├─ transcode.mjs                 # H.266/VVC → H.264 转码核心（剥 NAL、重排 Annex B、ffmpeg 参数）
+│  ├─ hls-tc.mjs                    # VVC 档的 HLS 转码任务（fMP4 分片、EVENT 清单、Range 发片、TTL 清理）
 │  ├─ monitor.mjs                   # 播放通道定时探针与告警
 │  ├─ recommend.mjs                 # 推荐 / 猜你喜欢排序
 │  ├─ static.mjs                    # 静态文件托管（越界校验、MIME、HEAD）
@@ -405,7 +410,7 @@ docker run --rm -v "$PWD":/w -w /w node:22-bookworm-slim sh -c \
 - **内置红果搜索**：主通道是官网搜索页自己用的 JSON 接口 `GET /api/search/result?query=`（只校验 UA，不依赖 App 签名），响应带 `channel: "web"`、`total`、`hasMore`；失败才降级为首页推荐池检索（`fallback: true`、`channel: "pool"`，结果不全）。
 - **需要 webview 嗅探的源**（`parse: 1`）不可用：本服务没有浏览器内核。
 - **同时播放上限**：内置红果解密流默认最多 6 路并发（`MAX_STREAMS` 可调）。同一集同一档位被多人同时点开只取址一次，`/api/metrics` 的 `dedupe.shared` 可看合并次数。
-- **红果内置流的分档**：1080P 是 **HEVC**，360P 是 **H.264**，两者浏览器可解（HEVC 需设备/浏览器支持，Chrome 有 GPU 时可硬解）；官方 360P–720P 中间档是 **H.266/VVC**，任何浏览器都没有解码器，只有服务端装了 7.1+ 的 ffmpeg 才由服务端转成 H.264 提供（菜单里标注「转码」）。转码线路是**边转边发、不可拖动**，CPU 占用约 12× 实时（单核），并发多了会排队；没有 ffmpeg 时这些档不列入菜单。给能解 VVC 的外部播放器直取仍可用 `?q=720p&vvc=1`。官方签名接口再变动时，服务端自动回落官网明文 360P；若连档位信息都取不到，`/api/play` 只降级为「仅 360P 兼容线路」，不会整条播放失败。
+- **红果内置流的分档**：1080P 是 **HEVC**，360P 是 **H.264**，两者浏览器可解（HEVC 需设备/浏览器支持，Chrome 有 GPU 时可硬解）；官方 360P–720P 中间档是 **H.266/VVC**，任何浏览器都没有解码器，只有服务端装了 7.1+ 的 ffmpeg 才由服务端转成 H.264 提供（菜单里标注「转码」）。转码线路走 **HLS 分片**：有真实总时长、进度条可拖动（转码完成前只能拖到已转好的位置，整集约十几秒转完），CPU 占用约 12× 实时（单核），并发多了会排队（`TRANSCODE_MAX_CONCURRENT`，默认 2）；没有 ffmpeg 时这些档不列入菜单。给能解 VVC 的外部播放器直取仍可用 `?q=720p&vvc=1`。官方签名接口再变动时，服务端自动回落官网明文 360P；若连档位信息都取不到，`/api/play` 只降级为「仅 360P 兼容线路」，不会整条播放失败。
 - **红果加密格式**：只支持 CENC（AES-128-CTR）、每样本 8 字节 IV、无 subsample、`moov` 前置的非分片 MP4——这是红果当前唯一在用的组合。上游若改成 `cbcs`/`cens`（AES-CBC 模式）、16 字节 IV、含 subsample 或分片 MP4，播放会直接返回 `CENC_UNSUPPORTED`（「该剧加密格式暂不支持，请切换其他源」），而不是解出花屏。解密前会先解析真实加密头做校验（`server/vendor/hongguo.cenc.patch.js`）。
 - **设备身份会被风控**：红果播放模型接口把「匿名注册的设备」当风控维度，同一份身份被判异常后签名重算多少次都只会拿到 200 空正文。服务端把身份存 `DATA_DIR/device.json` 长期复用，只有真收到空正文才换一份，且同一身份 60 秒内最多换一次。身份来源、注册 / 轮换 / 被节流次数见 `/api/metrics` 的 `official.device`（已脱敏）；`HONGGUO_DEVICE_ID` 钉死时不轮换。
 - **降级换源依赖别家也有同名剧**：替代源按标题相似度在其它源搜索结果里找，红果独播剧、译名差异大的剧通常找不到候选；此时只能换剧或等通道恢复。

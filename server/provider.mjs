@@ -518,24 +518,46 @@ export const provider = {
     }
   },
   // 清晰度清单：给 /api/play 用，失败不抛错（前端只显示 360P 兼容档）。
-  // timeoutMs 有上限：/api/play 不能为了菜单把起播拖住。
+  // timeoutMs 是首次探测的上限：/api/play 不能为了菜单把起播拖住。
+  // 「菜单只剩 auto+compat」的偶发退化，多半是上游 6–8s 才返回、刚好越过首个超时窗口，
+  // 所以判定为超时/网络抖动时再等一次，总预算 9s。重试不会重复打上游：
+  // official.info 内部按集做了 inflight 合并，第二次只是接着等同一份在途请求。
   async quality(id, timeoutMs = 6000) {
     const wait = acquire(BREAKERS.official);
     if (wait) return { tiers: [], expire: 0, error: `上游限流，${wait} 秒后重试` };
+    const deadline = Date.now() + 9000;
+    let lastError = null;
     try {
-      const info = await withTimeout(official.info(String(id)), timeoutMs, "清晰度查询超时");
-      reportOk(BREAKERS.official);
-      return {
-        tiers: info.tiers.map((tier) => ({
-          key: tier.key,
-          label: tier.label,
-          height: tier.height,
-          codec: tier.codec,
-          size: tier.size,
-          bitrate: tier.bitrate,
-        })),
-        expire: info.expire,
-      };
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const left = deadline - Date.now();
+        const budget =
+          attempt === 0
+            ? Math.max(1000, Math.min(timeoutMs, left))
+            : Math.max(1000, Math.min(3000, left));
+        try {
+          const info = await withTimeout(official.info(String(id)), budget, "清晰度查询超时");
+          reportOk(BREAKERS.official);
+          return {
+            tiers: info.tiers.map((tier) => ({
+              key: tier.key,
+              label: tier.label,
+              height: tier.height,
+              codec: tier.codec,
+              size: tier.size,
+              bitrate: tier.bitrate,
+            })),
+            expire: info.expire,
+          };
+        } catch (error) {
+          lastError = error;
+          const message = String((error && error.message) || error);
+          // 只有超时/网络抖动值得再等一次；被上游拒绝（空响应/风控/错误码）重试也没用。
+          if (!isTransientNetworkError(message)) break;
+          if (attempt === 0) METRICS.qualityRetries += 1;
+          if (deadline - Date.now() < 800) break;
+        }
+      }
+      throw lastError || new Error("清晰度查询失败");
     } catch (error) {
       const message = String((error && error.message) || error);
       // 与 stream() 同一套判据：被拒绝才熔断，超时/网络抖动只放掉探测。
@@ -597,6 +619,7 @@ export const provider = {
         lastCacheClearAt: METRICS.lastCacheClearAt,
         cooldownHits: METRICS.cooldownHits,
         officialSkipped: METRICS.officialSkipped,
+        qualityRetries: METRICS.qualityRetries,
       },
       official: official.stats,
       breakers: {
@@ -656,6 +679,8 @@ const METRICS = {
   cooldownHits: 0,
   // 官方通道因熔断被跳过的次数：这些请求直接走了 360P，没有白等模型超时。
   officialSkipped: 0,
+  // 清晰度查询二次等待的次数：增长说明上游经常在 6–8s 才返回（而不是真的不可用）。
+  qualityRetries: 0,
 };
 
 const CACHE_TTL = 300000;

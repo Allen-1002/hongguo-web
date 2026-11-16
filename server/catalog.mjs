@@ -699,21 +699,27 @@ export function createCatalog({ provider, sources }) {
       }
       const all = info && Array.isArray(info.tiers) && info.tiers.length ? info.tiers : null;
       // 1080P 是 HEVC（设备/浏览器支持时可硬解）；360P–720P 是 H.266/VVC，浏览器一定解不了。
-      // 只有服务端装了 7.1+ 的 ffmpeg 时，VVC 档才以「服务端边转码成 H.264」的形式提供（可播放但不可拖动）。
+      // 只有服务端装了 7.1+ 的 ffmpeg 时，VVC 档才以「服务端转码成 H.264 HLS 分片」的形式提供（可播放、可拖动）。
       const canTranscode = transcodeAvailable();
       const vvcCount = all ? all.filter((tier) => tier.codec === "vvc").length : 0;
       const tiers = all ? all.filter((tier) => tier.codec !== "vvc" || canTranscode) : null;
       // 「自动」实际上等价于最高档：把它的 codec 标成最高档编码，前端才能按本机解码能力
       // 正确置灰/回落（否则无 HEVC 的浏览器会默认起播必然黑屏的 1080P HEVC 流）。
       const topTier = tiers && tiers.length ? tiers[0] : null;
+      // VVC 档位走服务端 HLS 转码（/api/tc 清单）：清单能在播放中持续追加分片，
+      // 播放器因此拿得到真实总时长、进度条可拖动（旧的管道 fMP4 两样都做不到）。
+      const hlsUrl = (key) => "/api/tc/" + id + "/" + encodeURIComponent(key) + "/index.m3u8";
+      const topIsVvc = Boolean(topTier && topTier.codec === "vvc" && canTranscode);
       const options = [
         {
           key: "auto",
           label: "自动（最高）",
           height: topTier ? topTier.height : 0,
           codec: topTier ? topTier.codec : "",
-          transcode: false,
-          url: "/api/stream/" + id + "?q=auto",
+          transcode: topIsVvc,
+          hls: topIsVvc,
+          // 最高档是 VVC 时，「自动」也必须走转码清单：直连 VVC 一定黑屏。
+          url: topIsVvc ? hlsUrl(topTier.key) : "/api/stream/" + id + "?q=auto",
         },
         ...(tiers || []).map((tier) => {
           const transcoded = tier.codec === "vvc";
@@ -723,21 +729,23 @@ export function createCatalog({ provider, sources }) {
             height: tier.height,
             codec: tier.codec,
             transcode: transcoded,
-            url: "/api/stream/" + id + "?q=" + encodeURIComponent(tier.key) + (transcoded ? "&tc=1" : ""),
+            hls: transcoded,
+            url: transcoded ? hlsUrl(tier.key) : "/api/stream/" + id + "?q=" + encodeURIComponent(tier.key),
           };
         }),
-        { key: "compat", label: "360P 兼容", height: 360, codec: "h264", transcode: false, url: "/api/stream/" + id + "?q=compat" },
+        { key: "compat", label: "360P 兼容", height: 360, codec: "h264", transcode: false, hls: false, url: "/api/stream/" + id + "?q=compat" },
       ];
       const noteParts = [];
       if (tiers) noteParts.push("1080P 为 HEVC 编码：设备支持 HEVC 时可硬解，不支持时自动回落到 360P 兼容线路。");
       if (canTranscode && vvcCount)
-        noteParts.push("360P–720P 是 H.266/VVC，浏览器无法解码，已由服务端边转码成 H.264（可播放，但不能拖动进度）。");
+        noteParts.push("360P–720P 是 H.266/VVC，浏览器无法解码，已由服务端转码成 H.264 的 HLS 分片流（可播放、可拖动进度；首段约 1–3 秒就绪）。");
       else if (vvcCount)
         noteParts.push("官方 360P–720P 档位是 H.266/VVC 编码，浏览器无法解码，且服务端未启用转码（安装 ffmpeg 7.1+ 后可用），未列入菜单。");
       return {
         type: "native",
-        url: "/api/stream/" + id + "?q=auto",
-        contentType: "video/mp4",
+        // 与菜单里的「自动」保持一致：最高档是 VVC 时给的是转码清单地址。
+        url: options[0].url,
+        contentType: topIsVvc ? "application/vnd.apple.mpegurl" : "video/mp4",
         quality: {
           options,
           note: noteParts.length ? noteParts.join(" ") : "未取到高清档（官方接口暂不可用），当前仅提供 360P 兼容线路。",

@@ -267,9 +267,16 @@ input:focus,textarea:focus,.select:focus{border-color:var(--brand)}
 /* 注意：这里必须用 .player-inner:fullscreen #video（特异性 1,2,0），否则会被 #video{max-height:78vh/60vh}（1,0,0）压掉，
    全屏时视频只能占 60%~78% 高度，上下留大黑边。height:100% 同时避开 100vh 在移动端地址栏收放时的抖动。 */
 .player-inner:fullscreen #video{width:100%;height:100%;max-height:none;min-height:0;flex:1 1 auto;border-radius:0;object-fit:contain;background:#000}
-/* 全屏时整条顶栏隐藏，只留视频画面（顶栏一旦浮在画面上就会和系统状态栏/时间叠在一起）。
-   退出全屏仍可用：双击画面（web/app.js:2067）、Esc、F 键、以及 video 原生控制条的全屏按钮。 */
-.player-inner:fullscreen .player-bar{display:none}
+/* 全屏时顶栏改成浮在画面顶部的一层（不占布局、不挤压视频），3 秒无操作自动淡出，默认只留视频画面。
+   鼠标移动 / 触摸 / 按键都会重新唤出——否则手机上没有 Esc 和 F，双击又常被浏览器当成缩放，
+   用户根本点不到「退出全屏」。浮层带安全区，避免和刘海/状态栏重叠。 */
+.player-inner:fullscreen .player-bar{
+  position:absolute;left:0;right:0;top:0;z-index:5;
+  padding:calc(8px + env(safe-area-inset-top,0px)) max(12px,env(safe-area-inset-right,0px)) 8px max(12px,env(safe-area-inset-left,0px));
+  background:linear-gradient(180deg,rgba(0,0,0,.68),rgba(0,0,0,0));
+  transition:opacity .22s ease;
+}
+.player-inner:fullscreen.fs-idle .player-bar{opacity:0;pointer-events:none}
 .player-inner:fullscreen .phint{display:none}
 @media (max-width:640px){ .pactions{gap:6px} #btnRate,#btnQuality{min-width:56px} .phint{display:none} }
 

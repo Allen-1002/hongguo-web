@@ -6,10 +6,13 @@
   var state = {
     sources: [], source: '', classes: [], items: [], page: 1, hasMore: false,
     mode: 'home', tid: '', q: '', detail: null, line: 0, epIdx: 0, viewSource: '',
-    hls: null, histKey: null, lastSave: 0, pendingSeek: 0,
+    hls: null, hlsMode: false, histKey: null, lastSave: 0, pendingSeek: 0,
     pendingResume: null, pendingPlay: null,
     rate: 1, quality: -1, levels: [], qualityOptions: [], qualityNote: '',
     qualityKey: '', playKind: '', hevcCap: null, hevcFallback: false, silentSeek: false, hevcWarned: false,
+    // 高清优先：qUserChose=用户手动选过档（只有此时才写 URL ?quality=）；qParamOwner=?quality= 属于哪部剧；
+    // failedKeys=本机解不出来的档位，避免自动升级时又切回失败档；fallbackCount 限制自动降档次数。
+    qUserChose: false, qParamOwner: '', failedKeys: {}, fallbackCount: 0, upgradeTried: false, upgradeCount: 0, playToken: 0,
     // A4：起播/切档时间 + 同档重试一次性标志（10s 内解码失败先原样重载一次）
     switchAt: 0, switchRetried: false, switching: false,
     loadingMore: false, autoNextLatch: false, aggregate: false, aggGroups: [],
@@ -1454,23 +1457,118 @@
     }
     return { dead: false, badge: '', title: '' };
   }
-  // 默认起播档位：第一个可播的档位（HEVC/VVC 不可解时自动降到可播档），「自动」优先。
+  // 默认起播档位：高清优先。能在本机播放的档位里取分辨率最高的那档（服务端转码档也算），
+  // 360P 兼容永远只做最后兜底——以前「直连档优先」会让无 HEVC 的浏览器跳过 720P 转码档直接播 360P。
   function defaultPlayableOption() {
     var opts = (state.qualityOptions || []).filter(function (o) { return o.url && !qualityGate(o).dead; });
     if (!opts.length) return null;
-    // 优先「自动」，其次直连档（h264 原片），然后兼容档，最后才是服务端转码档（耗 CPU、不可拖动）。
+    // 「自动」等于最高档：本机能解就直接用它。
     var auto = opts.filter(function (o) { return o.key === 'auto'; })[0];
     if (auto) return auto;
-    var direct = opts.filter(function (o) { return !o.transcode && o.key !== 'auto'; })[0];
-    if (direct) return direct;
-    var compat = opts.filter(function (o) { return o.key === 'compat'; })[0];
-    return compat || opts[0];
+    // 其余按分辨率从高到低；同分辨率优先不转码（省 CPU、可拖动），360P 兼容排在最后。
+    var ranked = opts.filter(function (o) { return o.key !== 'compat'; }).sort(function (a, b) {
+      var ha = a.height || 0, hb = b.height || 0;
+      if (hb !== ha) return hb - ha;
+      if (!!a.transcode !== !!b.transcode) return a.transcode ? 1 : -1;
+      return 0;
+    });
+    if (ranked.length) return ranked[0];
+    return opts.filter(function (o) { return o.key === 'compat'; })[0] || opts[0];
+  }
+  // 当前剧的键（源|剧 id）：地址栏 ?quality= 只在同一部剧内沿用，换剧即失效。
+  function dramaKey() {
+    return String(state.viewSource || '') + '|' + String((state.detail && state.detail.id) || '');
+  }
+  // 统一把 /api/play 返回的档位写进 state（起播与后台补档共用）。
+  function applyQualityOptions(qi) {
+    state.qualityOptions = ((qi && qi.options) || []).map(function (o) {
+      return {
+        key: o.key, label: o.label, height: o.height,
+        codec: String(o.codec || '').toLowerCase(), url: o.url || '',
+        // transcode=true：服务端会转码成 H.264，浏览器能播 → 不置灰
+        transcode: o.transcode === true,
+        // hls=true：该档位是服务端转码出来的 HLS 清单，必须交给 hls.js 播（<video> 不认 m3u8）
+        hls: o.hls === true, levelIndex: null
+      };
+    });
+    state.qualityNote = (qi && qi.note) || '';
+  }
+  // 菜单里是否已有「真实档位」（不只是 auto/compat 两条兜底项）。
+  function hasRealTiers() {
+    return (state.qualityOptions || []).some(function (o) { return o.key !== 'auto' && o.key !== 'compat'; });
+  }
+  // 比当前档低、且本机可播的最高分辨率档；都不可播时回落 360P 兼容。
+  function lowerPlayableOption() {
+    var cur = optionByKey(state.qualityKey);
+    var curH = cur && cur.height ? cur.height : 1e9;
+    var cands = (state.qualityOptions || []).filter(function (o) {
+      return o.url && o.key !== 'auto' && o.key !== 'compat' && !qualityGate(o).dead && (o.height || 0) < curH;
+    }).sort(function (a, b) { return (b.height || 0) - (a.height || 0); });
+    if (cands[0]) return cands[0];
+    if (cur && cur.key === 'compat') return null;
+    return optionByKey('compat');
+  }
+  // 解码失败时的自动降档：先降到「本机可播的下一档高清」，360P 兼容只做最后一档。
+  function autoFallbackOnce() {
+    if (state.fallbackCount >= 3) { state.hevcFallback = true; return false; }
+    var from = optionByKey(state.qualityKey);
+    var next = lowerPlayableOption();
+    if (!next || !next.url) { state.hevcFallback = true; return false; }
+    state.fallbackCount += 1;
+    if (from && from.key) state.failedKeys[from.key] = 1;
+    var toCompat = next.key === 'compat';
+    if (!switchNativeQuality(next)) { state.hevcFallback = true; return false; }
+    if (toCompat) {
+      toast('该清晰度无法解码，已自动切换到 360P 兼容线路');
+      tryUpgradeQuality(true);
+    } else {
+      toast('该清晰度无法解码，已切换到「' + next.label + '」');
+    }
+    return true;
+  }
+  // 后台补问档位：起播时官方档位没取到（上游慢/超时）时，一旦拿到更高且本机可播的档位就第一时间切上去。
+  function tryUpgradeQuality(force) {
+    if (state.playKind !== 'native' || state.qUserChose) return;
+    if (state.upgradeTried && !force) return;
+    if (state.upgradeCount >= 2) return;
+    var d = state.detail, li = state.line, ei = state.epIdx;
+    var line = d && d.lines[li], ep = line && line.episodes[ei];
+    if (!ep) return;
+    var token = state.playToken;
+    var hadTiers = hasRealTiers();
+    state.upgradeTried = true;
+    var ready = hadTiers ? Promise.resolve(true) : api('/api/play', { source: state.viewSource, flag: line.flag, id: ep.id }).then(function (r) {
+      if (!r || !r.quality || !Array.isArray(r.quality.options) || r.quality.options.length < 2) return false;
+      applyQualityOptions(r.quality); updateQualityBtn(); return true;
+    }).catch(function () { return false; });
+    ready.then(function (ok) {
+      if (!ok) return;
+      if (token !== state.playToken || state.playKind !== 'native' || state.qUserChose) return;
+      if (state.detail !== d || state.line !== li || state.epIdx !== ei) return;
+      if (!hasRealTiers()) return;
+      // 只在「低清兜底档」或「起播时还没有真实档位的自动档」上升级，避免在已能播的高档之间来回切。
+      if (state.qualityKey && state.qualityKey !== 'compat' && (state.qualityKey !== 'auto' || hadTiers)) return;
+      // 目标档：自动档可播就用自动（服务端按本机能力给最高档），否则用本机可播的最高档。
+      var autoOpt = optionByKey('auto');
+      var best = (autoOpt && !qualityGate(autoOpt).dead) ? autoOpt : defaultPlayableOption();
+      if (!best || !best.url || best.key === 'compat') return;
+      if (state.failedKeys[best.key]) return;
+      // 只在当前是具体档位时才比较高度；auto/compat 兜底态的高度没有参考意义（新档位表已覆盖旧值）。
+      if (state.qualityKey && state.qualityKey !== 'auto' && state.qualityKey !== 'compat') {
+        var cur = optionByKey(state.qualityKey);
+        if (cur && best.key !== 'auto' && (cur.height || 0) >= (best.height || 0)) return;
+      }
+      state.upgradeCount += 1;
+      hidePlayerError();
+      if (switchNativeQuality(best)) toast('已切换到更高清晰度「' + best.label + '」');
+    });
   }
   // 切换到指定档位：native 直链靠换 src，HLS 靠 hls.js 的 level。
-  function switchNativeQuality(o) {
+  function switchNativeQuality(o, byUser) {
     var v = $('video'); if (!v || !o || !o.url) return false;
     var at = v.currentTime || 0;
     var wasPlaying = !v.paused;
+    if (byUser) state.qUserChose = true;   // 只有用户手动点档位才把该档写进地址栏
     state.qualityKey = o.key;
     state.hevcFallback = o.key === 'compat';
     state.switchAt = Date.now();
@@ -1480,8 +1578,22 @@
     state.switching = true;
     syncQualityParam(o.key);
     hidePlayerError();
-    v.src = authUrl(o.url);
+    var prevSrc = v.getAttribute('src') || '';
+    var nextSrc = authUrl(o.url);
+    // 转码档是 HLS 清单（hls=true）：必须换 hls.js 播放；直连档仍走 <video>。
+    var wantHls = !!o.hls || /\.m3u8(\?|$)/.test(String(o.url || ''));
+    destroyHls();
+    v.removeAttribute('src');
     try { v.load(); } catch (e) {}
+    if (wantHls) {
+      attachHls(nextSrc);
+    } else {
+      state.hlsMode = false;
+      // 同一个地址重新加载（例如自动档在官方档位补齐后重取）时加一个一次性参数，否则浏览器不会重新请求。
+      if (nextSrc === prevSrc) nextSrc += (nextSrc.indexOf('?') >= 0 ? '&' : '?') + '_r=' + Date.now();
+      v.src = nextSrc;
+      try { v.load(); } catch (e) {}
+    }
     if (wasPlaying) {
       var pr = v.play();
       if (pr && pr.catch) pr.catch(function () {});
@@ -1521,10 +1633,10 @@
     if (state.switching) { btn.textContent = '切换中…'; btn.classList.add('on'); return; }
     var multi = (state.qualityOptions || []).length > 1;
     var chosen = '';
-    if (state.playKind === 'native' && state.qualityKey) {
-      var picked = optionByKey(state.qualityKey);
-      chosen = picked ? picked.label : '';
-    } else if (state.quality >= 0 && state.levels[state.quality]) {
+    var picked = state.qualityKey ? optionByKey(state.qualityKey) : null;
+    if (picked) {
+      chosen = picked.label;
+    } else if (state.playKind === 'hls' && state.quality >= 0 && state.levels[state.quality]) {
       chosen = levelLabel(state.levels[state.quality]);
     }
     btn.textContent = '清晰度 ' + (chosen || currentResolutionLabel() || '自动');
@@ -1616,9 +1728,10 @@
       var gate = qualityGate(o);
       if (gate.dead) { toast(gate.title || (o.label + ' 本机无法解码')); return; }
     }
-    if (state.playKind === 'native' && o && o.url) {
+    // 有具体地址的档位（直连或服务端转码 HLS）都走换源；纯 HLS 多码率档只有 levelIndex。
+    if (o && o.url) {
       if (o.key === state.qualityKey) { toast('已是 ' + o.label); return; }
-      if (switchNativeQuality(o)) toast('清晰度：' + o.label);
+      if (switchNativeQuality(o, true)) { toast('清晰度：' + o.label); }
       return;
     }
     if (o.levelIndex != null && state.hls && (state.qualityOptions || []).length > 1) {
@@ -1633,7 +1746,7 @@
   }
   // 兼容旧调试钩子：无多档时提示，有 HLS 多档时在档位间循环。
   function cycleQuality() {
-    if (state.playKind === 'native' && (state.qualityOptions || []).length > 1) {
+    if ((state.qualityOptions || []).some(function (x) { return x.url; })) {
       // 只在「本机可播」的档位之间循环（vvc / 不可解 hevc 已被置灰）
       var nat = state.qualityOptions.filter(function (o) { return !qualityGate(o).dead; });
       if (!nat.length) { toast('没有本机可播放的清晰度档位'); return; }
@@ -1673,10 +1786,29 @@
       toast('当前浏览器不支持全屏');
     }
   }
+  // 全屏顶栏自动淡出：默认只留画面；鼠标移动 / 触摸 / 按键重新唤出，3 秒无操作再次隐藏。
+  // 之前全屏把整条顶栏 display:none，「退出全屏」按钮在手机上根本点不到（没有 Esc/F），这里补回入口。
+  var fsIdleTimer = null;
+  function fsBox() { return document.querySelector('.player-inner'); }
+  function showPlayerUi() {
+    var box = fsBox();
+    if (!box || !isFullscreen()) return;
+    box.classList.remove('fs-idle');
+    if (fsIdleTimer) clearTimeout(fsIdleTimer);
+    fsIdleTimer = setTimeout(function () {
+      fsIdleTimer = null;
+      if (isFullscreen()) box.classList.add('fs-idle');
+    }, 3000);
+  }
+  function resetPlayerUi() {
+    if (fsIdleTimer) { clearTimeout(fsIdleTimer); fsIdleTimer = null; }
+    var box = fsBox(); if (box) box.classList.remove('fs-idle');
+  }
   function syncFullBtn() {
     var b = $('btnFull'); if (!b) return;
     b.textContent = isFullscreen() ? '退出全屏' : '全屏';
     b.classList.toggle('on', isFullscreen());
+    if (isFullscreen()) showPlayerUi(); else resetPlayerUi();
   }
 
   function destroyHls() {
@@ -1780,6 +1912,58 @@
     }).catch(function (e) { toast('切换失败：' + e.message); });
   }
 
+
+  // 把一条 HLS 地址挂到 <video> 上。多码率 master 清单才生成码率档位；服务端转码清单是单码率，
+  // 档位仍由 state.qualityOptions（/api/play 给的菜单）决定，这里不覆盖。
+  function attachHls(url) {
+    var v = $('video');
+    state.hlsMode = true;
+    if (window.Hls && window.Hls.isSupported()) {
+      var hls = new window.Hls({ maxBufferLength: 30 });
+      state.hls = hls;
+      hls.loadSource(url); hls.attachMedia(v);
+      hls.on(window.Hls.Events.MANIFEST_PARSED, function () {
+        state.levels = (hls.levels || []).map(function (lv) {
+          return { height: lv.height, bitrate: lv.bitrate, name: lv.name || '' };
+        });
+        // 真正的多码率 HLS（master playlist）才给出多档选项；单码率只显示实际分辨率。
+        if (state.levels.length > 1) {
+          state.qualityOptions = [{ label: '自动', levelIndex: -1 }].concat(state.levels.map(function (lv, i) {
+            return { label: levelLabel(lv), levelIndex: i };
+          }));
+        }
+        updateQualityBtn();
+      });
+      hls.on(window.Hls.Events.LEVEL_SWITCHED, function () {
+        if (state.switching) state.switching = false;
+        updateResBadge(); updateQualityBtn();
+      });
+      var recovered = false;
+      hls.on(window.Hls.Events.ERROR, function (_e, data) {
+        if (!data || !data.fatal) return;
+        if (state.playKind === 'native') {
+          // 服务端转码档：转码失败/分片取不到时走和直链一样的降档阶梯，而不是干等一个通用报错。
+          if (state.switching) { state.switching = false; updateQualityBtn(); }
+          if (!state.hevcFallback && autoFallbackOnce()) return;
+          showPlayerError('HLS 流播放失败：' + (data.details || '流错误'));
+          toast('转码线路播放失败：' + (data.details || '流错误'));
+          return;
+        }
+        if (!recovered) {
+          recovered = true;
+          if (data.type === window.Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad();
+          else if (data.type === window.Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
+          else recovered = false;
+          if (recovered) { toast('播放异常，正在自动重试…'); return; }
+        }
+        showPlayerError('HLS 流播放失败：' + (data.details || '流错误'));
+        toast('播放失败：' + (data.details || '流错误'));
+      });
+    } else {
+      v.src = url;
+    }
+  }
+
   function openPlayer(url, type, startAt, auto, qualityInfo) {
     var v = $('video');
     state.pendingSeek = Math.max(0, Math.floor(startAt || 0));
@@ -1791,45 +1975,69 @@
     state.qualityKey = '';
     state.hevcFallback = false;
     state.hevcWarned = false;   // 每次起播/换剧都允许再提示一次「最高档解不了，已换档」
+    // 高清优先后每次起播都重新评估：用户手选标志、失败档、降档/补档计数全部归零。
+    state.qUserChose = false;
+    state.failedKeys = {};
+    state.fallbackCount = 0;
+    state.upgradeTried = false;
+    state.upgradeCount = 0;
     state.silentSeek = false;
-    state.playKind = type === 'hls' ? 'hls' : 'native';
+    // 只有「源自己给的 HLS」才算 hls 播放方式；内置红果的多档转码仍走 native 的档位体系
+    // （playKind 保持 native，转码档用 state.hlsMode 标记为 hls.js 播放）。
+    state.playKind = type === 'hls' && !(qualityInfo && qualityInfo.options) ? 'hls' : 'native';
+    state.hlsMode = false;
     state.switchAt = Date.now();
     state.switchRetried = false;
     state.switching = false;
     if (qualityInfo && Array.isArray(qualityInfo.options) && qualityInfo.options.length) {
-      state.qualityOptions = qualityInfo.options.map(function (o) {
-        return {
-          key: o.key, label: o.label, height: o.height,
-          codec: String(o.codec || '').toLowerCase(), url: o.url || '',
-          // transcode=true：服务端会转码成 H.264，浏览器能播 → 不置灰
-          transcode: o.transcode === true, levelIndex: null
-        };
-      });
-      state.qualityNote = qualityInfo.note || '';
-      // 地址栏里的 ?q= 是用户上次选的档位（切档时写入），刷新/分享回来仍按它起播。
+      applyQualityOptions(qualityInfo);
+      // 地址栏里的 ?quality= 只在「属于当前这部剧」时才认：上一部剧残留的低清档
+      // 不能把新剧也压在 360P（高分辨率永远优先）。
       var wantQ = urlQualityParam();
       var wantOpt = wantQ ? optionByKey(wantQ) : null;
-      if (wantOpt && wantOpt.url && !qualityGate(wantOpt).dead) {
+      var owned = !state.qParamOwner || state.qParamOwner === dramaKey();
+      if (wantOpt && wantOpt.url && owned && !qualityGate(wantOpt).dead) {
         url = wantOpt.url;
         state.qualityKey = wantOpt.key;
         state.hevcFallback = wantOpt.key === 'compat';
+        state.qUserChose = true;   // 是用户当初手选/分享链接带过来的档位，换集/刷新继续沿用
       } else if (state.playKind === 'native') {
-        // 最高档本机解不出来（HEVC/VVC 且未转码）时，直接起播第一个可播档，省掉一次必然失败的起播。
+        // 最高档本机解不出来（HEVC/VVC 且未转码）时，直接起播「本机可播的最高分辨率」；
+        // 首选是高清（含服务端转码档），360P 兼容只做最后兜底。
         var top = state.qualityOptions[0];
         var playable = defaultPlayableOption();
-        if (top && playable && playable.url && qualityGate(top).dead) {
+        // 目标档不是「自动」那一路流时要换地址：既包括降到较低的高清档，
+        // 也包括最高档本身是 VVC——这时「自动」给的是服务端转码清单，必须用它的地址。
+        if (playable && playable.url && (playable.key !== 'auto' || playable.hls)) {
           url = playable.url;
           state.qualityKey = playable.key;
           state.hevcFallback = playable.key === 'compat';
-          if (!state.hevcWarned) {
+          if (playable.key !== 'auto' && top && qualityGate(top).dead && !state.hevcWarned) {
             state.hevcWarned = true;
-            toast('「' + top.label + '」' + qualityGate(top).badge + '，已改用「' + playable.label + '」线路');
+            toast('「' + top.label + '」' + qualityGate(top).badge + '，已改用本机可播的最高档「' + playable.label + '」');
           }
         }
       }
     }
-    if (state.playKind === 'native' && !state.qualityKey && optionByKey('auto')) state.qualityKey = 'auto';
+    if (state.playKind === 'native' && !state.qualityKey) {
+      var autoOpt0 = optionByKey('auto');
+      if (autoOpt0 && !qualityGate(autoOpt0).dead) state.qualityKey = 'auto';
+      else {
+        var p0 = defaultPlayableOption();
+        if (p0) { state.qualityKey = p0.key; if (p0.url) url = p0.url; state.hevcFallback = p0.key === 'compat'; }
+      }
+    }
+    state.playToken = (state.playToken || 0) + 1;
     syncQualityParam(state.playKind === 'native' ? state.qualityKey : '');
+    // 起播时没拿到官方档位（上游慢/超时）→ 后台补问一次，拿到更高可播档就第一时间切上去。
+    if (state.playKind === 'native' && !hasRealTiers()) {
+      var upToken = state.playToken;
+      setTimeout(function () { if (upToken === state.playToken) tryUpgradeQuality(); }, 1200);
+    }
+    // 选中的档位是服务端转码 HLS（hls=true）时交给 hls.js；否则仍走 <video> 直连。
+    var chosenOpt0 = state.qualityKey ? optionByKey(state.qualityKey) : null;
+    state.hlsMode = state.playKind === 'hls' || !!(chosenOpt0 && chosenOpt0.hls);
+    if (state.hlsMode && chosenOpt0 && chosenOpt0.url) url = chosenOpt0.url;
     url = authUrl(url);
     updateResBadge();
     updateQualityBtn();
@@ -1840,46 +2048,8 @@
     v.removeAttribute('src');
     try { v.load(); } catch (e) {}
     $('player').classList.remove('hidden');
-    if (type === 'hls') {
-      if (window.Hls && window.Hls.isSupported()) {
-        var hls = new window.Hls({ maxBufferLength: 30 });
-        state.hls = hls;
-        hls.loadSource(url); hls.attachMedia(v);
-        hls.on(window.Hls.Events.MANIFEST_PARSED, function () {
-          state.levels = (hls.levels || []).map(function (lv) {
-            return { height: lv.height, bitrate: lv.bitrate, name: lv.name || '' };
-          });
-          // 真正的多码率 HLS（master playlist）才给出多档选项；单码率只显示实际分辨率。
-          if (state.levels.length > 1) {
-            state.qualityOptions = [{ label: '自动', levelIndex: -1 }].concat(state.levels.map(function (lv, i) {
-              return { label: levelLabel(lv), levelIndex: i };
-            }));
-          }
-          updateQualityBtn();
-        });
-        hls.on(window.Hls.Events.LEVEL_SWITCHED, function () {
-          if (state.switching) state.switching = false;
-          updateResBadge(); updateQualityBtn();
-        });
-        var recovered = false;
-        hls.on(window.Hls.Events.ERROR, function (_e, data) {
-          if (!data || !data.fatal) return;
-          if (!recovered) {
-            recovered = true;
-            if (data.type === window.Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad();
-            else if (data.type === window.Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
-            else recovered = false;
-            if (recovered) { toast('播放异常，正在自动重试…'); return; }
-          }
-          showPlayerError('HLS 流播放失败：' + (data.details || '流错误'));
-          toast('播放失败：' + (data.details || '流错误'));
-        });
-      } else {
-        v.src = url;
-      }
-    } else {
-      v.src = url;
-    }
+    if (state.hlsMode) attachHls(url);
+    else v.src = url;
     applyRate();
     state.autoNextLatch = false;
     armPlayWatchdog();
@@ -1887,12 +2057,14 @@
     if (p && p.catch) p.catch(function (err) {
       if (!err) return;
       // 自动连播没有用户手势，部分移动端浏览器会以 NotAllowedError 拦截有声播放；静音重试一次
+      // 浏览器拦了有声自动播放（移动端/严格策略）：无论是否自动连播都静音重试一次，
+      // 否则用户点了剧集却看到黑屏、也没有任何提示（点播场景尤其容易被误判成「播放不了」）。
       if (err.name === 'NotAllowedError') {
-        if (!auto || v.muted) return;
+        if (v.muted) return;
         v.muted = true;
         var retry = v.play();
         if (retry && retry.catch) retry.catch(function () {});
-        toast('已静音自动续播，点音量可恢复声音');
+        toast(auto ? '已静音自动续播，按 M 键可恢复声音' : '浏览器拦截了有声播放，已静音开始播放，按 M 键可恢复声音');
         return;
       }
       // 已经有 MediaError、或错误本身就是「没有可播放的源」（NotSupportedError），都交给 error 事件的
@@ -2145,18 +2317,15 @@
       scheduleAutoNext();
     });
     // HEVC 在 Chrome/Edge 上常见「有声音没画面」：容器与音轨能解，视频轨不支持，且不触发 error。
-    // 播了 2 秒还拿不到 videoWidth 就判定该档解不出来，回落 360P 兼容线路。
+    // 播了 2 秒还拿不到 videoWidth 就判定该档解不出来：先降到「本机可播的下一档高清」，
+    // 360P 兼容只做最后一档（以前直接掉到 360P，明明还有 720P 转码档可用）。
     v.addEventListener('timeupdate', function () {
       if (state.playKind !== 'native') return;
       if (v.videoWidth > 0) { clearDiag(); return; }
-      if (state.hevcFallback) return;
+      if (state.hevcFallback || state.switching) return;
       if (v.paused || v.readyState < 2) return;
       if (v.currentTime < 2) return;
-      var compat = optionByKey('compat');
-      if (!compat || !compat.url) return;
-      state.hevcFallback = true;
-      toast('该清晰度无法解码，已自动切换到 360P 兼容线路');
-      switchNativeQuality(compat);
+      autoFallbackOnce();
     });
     // 播放失败三级阶梯：同档重试一次 → 回退 360P 兼容线路一次 → 给出具体原因。
     // 旧实现只处理 code 3/4 且直接降档，网络类错误（code 2）完全没提示，页面就那么黑着。
@@ -2170,16 +2339,8 @@
       var label = mediaErrLabel(err.code);
       // 第一级：刚起播/刚切档 10 秒内失败，先原样重载一次同档（一次性标志，避免失败循环）。
       if (!state.switchRetried && Date.now() - state.switchAt < 10000 && replaySameSource(label)) return;
-      // 第二级：回退 360P 兼容线路，整个播放过程只做一次（hevcFallback 兼作一次性标志）。
-      if (!state.hevcFallback) {
-        var compat = optionByKey('compat');
-        if (compat && compat.url) {
-          state.hevcFallback = true;
-          toast(label + '，已自动切换到 360P 兼容线路');
-          switchNativeQuality(compat);
-          return;
-        }
-      }
+      // 第二级：先降到「本机可播的下一档高清」，都不可播才回退 360P 兼容（整段播放有次数上限）。
+      if (!state.hevcFallback && autoFallbackOnce(label)) return;
       // 第三级：阶梯走完还失败，探一次真地址再给结论——「源挂了」和「设备解不了」要分开说，
       // 否则用户对着编码问题一直点重试，或者对着源故障去切清晰度。
       var msg = '播放失败：' + label + '，可尝试切换数据源或换一集';
@@ -2187,6 +2348,13 @@
       toast(msg);
     });
     v.addEventListener('dblclick', function (e) { e.preventDefault(); toggleFullscreen(); });
+    // 全屏浮层靠这些事件唤出；手机触发不了 mousemove，必须绑 touchstart/pointerdown。
+    var fsEl = fsBox();
+    if (fsEl) {
+      ['mousemove', 'pointerdown', 'touchstart'].forEach(function (ev) {
+        fsEl.addEventListener(ev, showPlayerUi, { passive: true });
+      });
+    }
     document.addEventListener('keydown', onPlayerKey);
     document.addEventListener('fullscreenchange', syncFullBtn);
     document.addEventListener('webkitfullscreenchange', syncFullBtn);
@@ -2201,7 +2369,13 @@
     if (/^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName || '') || t.isContentEditable) return;
     if (e.ctrlKey || e.metaKey || e.altKey) return;
     var v = $('video'), k = e.key;
-    if (k === 'Escape') { closeQualityMenu(); return; }
+    showPlayerUi();
+    if (k === 'Escape') {
+      closeQualityMenu();
+      // 正常浏览器 Esc 会自己退出元素全屏；PWA / iframe 里不一定，这里补一刀保证退得掉。
+      if (isFullscreen()) toggleFullscreen();
+      return;
+    }
     if (k === ' ' || k === 'Spacebar' || k === 'k' || k === 'K') {
       e.preventDefault();
       if (v.paused) { var pr = v.play(); if (pr && pr.catch) pr.catch(function () {}); }
@@ -2231,12 +2405,16 @@
 
   // 清晰度写进地址栏（?quality=compat）：刷新、前进后退、把链接发给别人时还是这一档。
   // 注意不能叫 q——?q= 是搜索关键词（bootFromQuery 会拿它直接 doSearch）。其它参数原样保留。
+  // 只把「用户手动选过的档位」写进地址栏；自动选择/自动降档一律不写，
+  // 否则自动兜底到 360P 后参数会残留，下一部剧/下一集也被压在低清（高分辨率永远优先）。
   function syncQualityParam(key) {
     try {
+      var k = state.qUserChose ? (key || '') : '';
+      state.qParamOwner = k ? dramaKey() : '';
       var u = new URL(location.href);
       var cur = u.searchParams.get('quality') || '';
-      if (cur === (key || '')) return;
-      if (key) u.searchParams.set('quality', key); else u.searchParams.delete('quality');
+      if (cur === k) return;
+      if (k) u.searchParams.set('quality', k); else u.searchParams.delete('quality');
       history.replaceState(history.state, '', u.pathname + u.search + u.hash);
     } catch (e) {}
   }
@@ -2293,6 +2471,8 @@
         }
         if (pick && pick.url) purl = pick.url;
       }
+      // 转码档是 HLS 清单：<video> 预取不认 m3u8，预热没意义，直接记成已处理。
+      if (/\.m3u8(\?|$)/.test(String(purl))) { prefetchCache.set(key, { at: Date.now() }); trimPrefetch(); return; }
       prefetchEl._hgKey = key;
       prefetchEl.src = authUrl(purl);
     }).catch(function () { prefetchKey = ''; });
@@ -2322,6 +2502,7 @@
     v.removeAttribute('src'); try { v.load(); } catch (e) {}
     stopPrefetch();
     destroyHls();
+    state.hlsMode = false;
     state.switching = false;
     $('player').classList.add('hidden');
   }

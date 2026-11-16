@@ -3,7 +3,8 @@ import { timingSafeEqual } from "node:crypto";
 import { fail, statusOf, publicMessage, headersOf } from "./errors.mjs";
 import { createStaticHandler } from "./static.mjs";
 import { createStreamHandler } from "./stream.mjs";
-import { transcodeToResponse, transcodeStats } from "./transcode.mjs";
+import { serveTranscodePlaylist, serveTranscodeFile, hlsTranscodeStats } from "./hls-tc.mjs";
+import { transcodeStats } from "./transcode.mjs";
 import { proxyMedia, proxyHls } from "./media.mjs";
 import { isPrivateHost } from "./net.mjs";
 
@@ -171,6 +172,7 @@ export function createServer({ provider, sources, catalog, users = null, monitor
         ...(typeof provider.metrics === "function" ? provider.metrics() : {}),
         ...(typeof serveStream.dedupe === "function" ? { dedupe: serveStream.dedupe() } : {}),
         transcode: transcodeStats(),
+        hlsTranscode: hlsTranscodeStats(),
         playback: monitor ? monitor.snapshot() : null,
       })],
 
@@ -416,17 +418,33 @@ export function createServer({ provider, sources, catalog, users = null, monitor
 
     // ---- 内置红果：服务端解密流 ----
     ["GET", /^\/api\/stream\/(\d{1,30})$/, async ({ req, res, params, q }) => {
-      // tc=1：该档是 H.266/VVC，交给服务端 ffmpeg 转成 H.264（浏览器没有 VVC 解码器）。
-      if (q.get("tc") === "1")
-        return transcodeToResponse({
-          provider,
-          epId: params[0],
-          quality: q.get("q") || "auto",
-          req,
-          res,
-          logger: (entry) => console.log(JSON.stringify(entry)),
-        });
       return serveStream(req, res, params[0], q.get("q") || "auto", q.get("vvc") === "1");
+    }],
+
+    // ---- 内置红果：VVC 档位的服务端 HLS 转码（可拖动进度）----
+    // 清单里写的是绝对路径分片地址；带访问口令的部署要把 at 一路带到分片请求上，
+    // 否则 hls.js 请求分片时没有口令，全部 401。
+    ["GET", /^\/api\/tc\/(\d{1,30})\/([^/]+)\/index\.m3u8$/, async ({ req, res, params, url }) => {
+      const at = url.searchParams.get("at");
+      await serveTranscodePlaylist({
+        provider,
+        epId: params[0],
+        quality: decode(params[1]),
+        req,
+        res,
+        logger: (entry) => console.log(JSON.stringify(entry)),
+        authSuffix: at ? "?at=" + encodeURIComponent(at) : "",
+      });
+    }],
+    ["GET", /^\/api\/tc\/(\d{1,30})\/([^/]+)\/([^/]+)$/, async ({ req, res, params }) => {
+      await serveTranscodeFile({
+        epId: params[0],
+        quality: decode(params[1]),
+        file: decode(params[2]),
+        req,
+        res,
+        logger: (entry) => console.log(JSON.stringify(entry)),
+      });
     }],
   ];
 

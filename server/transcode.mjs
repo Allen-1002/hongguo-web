@@ -1,6 +1,7 @@
 // H.266/VVC 服务端转码：浏览器的解码器里没有 VVC（Chrome/Edge/Firefox 都没有），
 // 所以红果 360P–720P 这几档官方 VVC 流送进 <video> 只能黑屏。
-// 这里把服务端已解密的 VVC 分片重排为 Annex B，交给 ffmpeg 转成 H.264 后以分片 MP4 推给浏览器。
+// 这里把服务端已解密的 VVC 分片重排为 Annex B，交给 ffmpeg 转成 H.264；
+// 封装由 hls-tc.mjs 用 fMP4 分片（HLS）完成，播放器因此有真实时长、可拖动进度。
 //
 // 上游的 VVC 文件有两个坑（实测）：
 //   1. 采样描述里的 4CC 写的是 hvc1（HEVC），实际码流是 VVC → 必须自己按 stsz/stco/stsc 剥出 NAL；
@@ -11,15 +12,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fail } from "./errors.mjs";
-import { QUALITIES } from "./stream.mjs";
 
 const FFMPEG = process.env.FFMPEG_PATH || "ffmpeg";
 const MAX_INPUT = Number(process.env.TRANSCODE_MAX_INPUT_BYTES || 96 * 1024 * 1024);
-// 转码是「整集读进内存 + 起一个 ffmpeg」，成本远高于直传：必须独立限并发。
-// 不设上限时，任何人循环请求 ?tc=1 就能把容器内存和 CPU 打满（review S2）。
-const MAX_CONCURRENT = Math.max(1, Number(process.env.TRANSCODE_MAX_CONCURRENT || 2) || 2);
-let active = 0;
-const STATS = { transcodes: 0, failures: 0, lastError: "", lastAt: 0, bytesIn: 0, bytesOut: 0 };
 let availability = null;
 
 // ffmpeg 是否存在只在第一次用到时探一次；没有就明确告知前端，而不是给一段黑屏。
@@ -35,7 +30,7 @@ export function transcodeAvailable() {
 }
 
 export function transcodeStats() {
-  return { available: transcodeAvailable(), active, limit: MAX_CONCURRENT, ...STATS };
+  return { available: transcodeAvailable() };
 }
 
 function boxes(buf, start, end) {
@@ -171,111 +166,36 @@ async function readAll(stream) {
   return buf.subarray(0, total);
 }
 
-/**
- * 把某一档 VVC 流转成 H.264 分片 MP4 直接写进 res（chunked，无 Content-Length，不可拖动）。
- * 调用方负责先写头？不——这里写头，因为要等 ffmpeg 起来、确认能产出数据再承诺 200。
- */
-export async function transcodeToResponse({ provider, epId, quality, req, res, logger }) {
-  if (!transcodeAvailable()) {
-    throw fail(
-      "CODEC_UNSUPPORTED",
-      "该档位是 H.266/VVC 编码，浏览器无法解码，且服务端未安装 ffmpeg（设置 FFMPEG_PATH 后可用转码播放）"
-    );
-  }
-  if (!["GET", "HEAD"].includes(req.method)) throw fail("BAD_METHOD", "只支持 GET / HEAD");
-  if (!QUALITIES.has(String(quality))) throw fail("BAD_INPUT", "清晰度参数无效");
-  if (active >= MAX_CONCURRENT) throw fail("BUSY", "同时转码数已达上限（" + MAX_CONCURRENT + "），请稍后重试");
-  const stream = await provider.stream(epId, { quality });
-  if (req.method === "HEAD") {
-    res.writeHead(200, { "content-type": "video/mp4", "cache-control": "no-store", "x-stream-transcode": "1" });
-    return res.end();
-  }
-  active++;
-  try {
-    return await transcodeNow({ stream, epId, quality, res, logger });
-  } finally {
-    active--;
-  }
-}
-
-async function transcodeNow({ stream, epId, quality, res, logger }) {
+// 把已解密的整集 mp4 拆成「Annex B 视频 + 纯音频 mp4」并落到临时目录，供 ffmpeg 读取。
+// 旧的分片 MP4 直推和新的 HLS 转码共用这一段（两条路都要求同样的上游预处理）。
+export async function stageVvcInput(stream) {
   const buf = await readAll(stream);
   const layout = analyse(buf);
-  // 注意 hvc1 必须放行：红果的 VVC 流在 stsd 里写的就是 hvc1（见文件头注释第 1 条），
-  // 按 4CC 判断会把真正需要转码的流挡在门外。hev1 才是不需要转码的真 HEVC。
+  // hvc1 必须放行：红果的 VVC 流在 stsd 里写的就是 hvc1，按 4CC 判断会把真正需要转码的流挡在门外。
   if (!/^(vvc1|bv2C|hvc1)$/.test(layout.video.entry)) {
     throw fail("CODEC_UNSUPPORTED", "该档位不是 H.266/VVC，无需服务端转码");
   }
   const annex = annexB(buf, layout.video);
   const audio = audioOnlyMp4(buf, layout);
-  STATS.bytesIn += buf.length;
-
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hg-tc-"));
   const vFile = path.join(dir, "v.h266");
   const aFile = path.join(dir, "a.mp4");
   fs.writeFileSync(vFile, annex);
   if (audio) fs.writeFileSync(aFile, audio);
+  return { dir, vFile, aFile, hasAudio: Boolean(audio), bytesIn: buf.length };
+}
 
+export function dropStage(dir) {
+  if (!dir) return;
+  fs.rm(dir, { recursive: true, force: true }, () => {});
+}
+
+// 转码共用的编码参数（输出封装由调用方追加）。
+export function h264Args({ vFile, aFile, hasAudio }) {
   const args = ["-hide_banner", "-v", "error", "-nostdin", "-f", "vvc", "-i", vFile];
-  if (audio) args.push("-i", aFile);
+  if (hasAudio) args.push("-i", aFile);
   args.push("-map", "0:v:0");
-  if (audio) args.push("-map", "1:a:0");
-  args.push(
-    "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
-    "-c:a", "copy",
-    "-movflags", "frag_keyframe+empty_moov+default_base_moof",
-    "-f", "mp4", "pipe:1"
-  );
-
-  return await new Promise((resolve, reject) => {
-    const child = spawn(FFMPEG, args, { stdio: ["ignore", "pipe", "pipe"] });
-    let started = false;
-    let stderr = "";
-    let cleaned = false;
-    const cleanup = () => {
-      if (cleaned) return;
-      cleaned = true;
-      try { child.kill("SIGKILL"); } catch { /* 已退出 */ }
-      fs.rm(dir, { recursive: true, force: true }, () => {});
-    };
-    child.stderr.on("data", (d) => { stderr = (stderr + d.toString()).slice(-2000); });
-    child.on("error", (error) => {
-      cleanup();
-      STATS.failures += 1;
-      STATS.lastError = String(error.message || error);
-      reject(fail("UPSTREAM_ERROR", "转码进程启动失败"));
-    });
-    child.stdout.on("data", (chunk) => {
-      if (!started) {
-        started = true;
-        STATS.transcodes += 1;
-        STATS.lastAt = Date.now();
-        res.writeHead(200, {
-          "content-type": "video/mp4",
-          "cache-control": "no-store",
-          // 转码是边转边发、没有 Content-Length：如实告知不可随机拖动
-          "accept-ranges": "none",
-          "x-stream-transcode": "1",
-          "x-stream-quality": String(stream.quality || quality),
-          "x-stream-codec": "h264",
-        });
-        if (logger) logger({ event: "transcode_start", epId, quality, bytesIn: buf.length });
-      }
-      STATS.bytesOut += chunk.length;
-      if (!res.write(chunk)) child.stdout.pause();
-    });
-    res.on("drain", () => child.stdout.resume());
-    res.on("close", cleanup);
-    child.on("exit", (code) => {
-      cleanup();
-      if (!started) {
-        STATS.failures += 1;
-        STATS.lastError = stderr || "ffmpeg 退出码 " + code;
-        reject(fail("UPSTREAM_ERROR", "转码失败（详见服务端日志）"));
-        return;
-      }
-      if (!res.writableEnded) res.end();
-      resolve();
-    });
-  });
+  if (hasAudio) args.push("-map", "1:a:0");
+  args.push("-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p", "-c:a", "copy");
+  return args;
 }
