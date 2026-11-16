@@ -103,7 +103,7 @@ public class MainActivity extends Activity {
                 fullView = view;
                 fullCallback = callback;
                 root.addView(view, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-                setImmersive(true);
+                setFullscreenBars(true);
                 setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
             }
 
@@ -114,7 +114,7 @@ public class MainActivity extends Activity {
                 fullView = null;
                 if (fullCallback != null) fullCallback.onCustomViewHidden();
                 fullCallback = null;
-                setImmersive(false);
+                setFullscreenBars(false);
                 setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED);
             }
 
@@ -194,7 +194,7 @@ public class MainActivity extends Activity {
     }
 
     @SuppressWarnings("deprecation")
-    private void setImmersive(boolean on) {
+    private void setFullscreenBars(boolean on) {
         if (Build.VERSION.SDK_INT >= 30) {
             WindowInsetsController c = getWindow().getInsetsController();
             if (c == null) return;
