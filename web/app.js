@@ -216,11 +216,61 @@
   function deleteJson(path) { return request(path, null, { method: 'DELETE' }); }
 
   // 顶部版本标识：从 /health 读取服务端实际版本，避免前端硬编码与镜像版本脱节
+  // 同时读取运行模式：手机 App 模式（mobile=true）下没有账号系统，数据只存本机，
+  // 前端用固定的本机令牌免登录，账号菜单换成「导出 / 导入备份」。
+  var healthReady = null;
   function loadVersion() {
-    fetch('/health', { headers: { Accept: 'application/json' } })
+    healthReady = fetch('/health', { headers: { Accept: 'application/json' } })
       .then(function (r) { return r.json(); })
-      .then(function (j) { if (j && j.version) $('appVersion').textContent = 'v' + j.version; })
-      .catch(function () {});
+      .then(function (j) {
+        if (j && j.version) $('appVersion').textContent = 'v' + j.version;
+        if (j && j.mobile) enterMobileMode();
+        return j;
+      })
+      .catch(function () { return null; });
+    return healthReady;
+  }
+  var mobileMode = false;
+  function enterMobileMode() {
+    mobileMode = true;
+    document.documentElement.classList.add('mobile-app');
+    if (!userToken()) setUserToken('local');
+    var mb = $('btnMenuAccount');
+    if (mb && mb.firstChild) mb.firstChild.nodeValue = '数据';
+    ['btnAccount', 'btnRegister', 'btnLogout'].forEach(function (id) { var el = $(id); if (el) el.classList.add('hidden'); });
+    ['btnBackupExport', 'btnBackupImport'].forEach(function (id) { var el = $(id); if (el) el.classList.remove('hidden'); });
+  }
+  function exportBackup() {
+    api('/api/me/backup').then(function (data) {
+      var text = JSON.stringify(data, null, 2);
+      var d = new Date(), pad = function (n) { return (n < 10 ? '0' : '') + n; };
+      var name = 'hongguo-backup-' + d.getFullYear() + pad(d.getMonth() + 1) + pad(d.getDate()) + '-' + pad(d.getHours()) + pad(d.getMinutes()) + '.json';
+      // App 壳提供原生保存（写到「下载」目录）；浏览器里退回普通下载。
+      if (window.HongguoApp && typeof window.HongguoApp.saveFile === 'function') {
+        var ok = window.HongguoApp.saveFile(name, text);
+        toast(ok ? ('已保存到「下载」：' + name) : '保存失败');
+        return;
+      }
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([text], { type: 'application/json' }));
+      a.download = name;
+      document.body.appendChild(a); a.click();
+      setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+    }).catch(function (e) { toast('导出失败：' + (e.message || e)); });
+  }
+  function importBackup(file) {
+    if (!file) return;
+    var reader = new FileReader();
+    reader.onload = function () {
+      var data;
+      try { data = JSON.parse(String(reader.result || '')); } catch (e) { toast('备份文件不是有效的 JSON'); return; }
+      postJson('/api/me/backup', data).then(function (r) {
+        var c = (r && r.counts) || {};
+        toast('已导入：历史 ' + (c.history || 0) + '、收藏 ' + (c.favorites || 0) + '、追更 ' + (c.follows || 0));
+        return Promise.all([mergeServerHistory(), loadFavs(), loadFollows(), syncRateFromServer()]);
+      }).catch(function (e) { toast('导入失败：' + (e.message || e)); });
+    };
+    reader.readAsText(file);
   }
 
   function cur() { return state.source || ''; }
@@ -298,6 +348,7 @@
       mb.classList.toggle('logged', logged);
     }
     // 账号分组：未登录显示「登录 / 注册」，已登录显示「用户名 / 退出」。
+    if (mobileMode) return; // 手机 App 模式：账号入口一直隐藏（见 enterMobileMode）
     var reg = $('btnRegister'); if (reg) reg.classList.toggle('hidden', logged);
     var out = $('btnLogout'); if (out) out.classList.toggle('hidden', !logged);
   }
@@ -2838,6 +2889,19 @@
     }, { rootMargin: '600px 0px' }).observe($('sentinel'));
   }
   $('btnBack').addEventListener('click', function () { setView('home'); });
+
+  // 安卓 App 壳的「返回键」：由外到内逐层关闭，返回 true 表示已处理，false 交给系统（退到后台）。
+  window.hongguoBack = function () {
+    if (document.fullscreenElement && document.exitFullscreen) { document.exitFullscreen().catch(function () {}); return true; }
+    var openMenu = document.querySelector('.menupanel:not(.hidden)');
+    if (openMenu) { closeMenus(); return true; }
+    var q = $('qualityMenu'); if (q && !q.classList.contains('hidden')) { closeQualityMenu(); return true; }
+    var modals = document.querySelectorAll('.modal:not(.hidden)');
+    if (modals.length) { modals[modals.length - 1].classList.add('hidden'); return true; }
+    if (!$('player').classList.contains('hidden')) { closePlayer(); return true; }
+    if (!$('detail').classList.contains('hidden')) { setView('home'); return true; }
+    return false;
+  };
   $('btnClosePlayer').addEventListener('click', closePlayer);
   $('btnPlayerRetry').addEventListener('click', function () {
     var btn = $('btnPlayerRetry');
@@ -2917,6 +2981,9 @@
     else openAuth('login');
   });
   $('btnRegister').addEventListener('click', function () { openAuth('register'); });
+  $('btnBackupExport').addEventListener('click', exportBackup);
+  $('btnBackupImport').addEventListener('click', function () { $('backupFile').value = ''; $('backupFile').click(); });
+  $('backupFile').addEventListener('change', function () { importBackup(this.files && this.files[0]); });
   $('btnLogout').addEventListener('click', function () {
     if (window.confirm('退出登录？本机观看记录会保留。')) logout();
   });
@@ -3023,7 +3090,8 @@
     });
     window.addEventListener('focus', checkSwUpdate);
   }
-  loadSources().then(function () {
+  // 先等 /health 确认运行模式（手机模式要在 refreshMe 前写入本机令牌），再加载数据。
+  Promise.resolve(healthReady).then(loadSources).then(function () {
     var sp = new URLSearchParams(location.search);
     if (!bootFromQuery()) loadHome();
     if (sp.get('manage') === '1') openManage();

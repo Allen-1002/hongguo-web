@@ -230,6 +230,24 @@ docker compose down -v                        # 连数据卷一起删（会丢�
 
 Chrome/Edge 地址栏右侧会出现「安装」；手机浏览器「添加到主屏幕」后以独立窗口运行。Service Worker 需要安全上下文（`http://localhost` 或 HTTPS），用局域网 IP 的纯 HTTP 打开时页面可用但没有离线缓存、不能安装。
 
+### 3.6.1 安卓 App（不需要服务器）
+
+`android/` 是一个安卓壳：App 里内嵌 [nodejs-mobile](https://github.com/nodejs-mobile/nodejs-mobile)（Node 18），在手机本机运行同一份 `server/`，WebView 打开 `http://127.0.0.1:38787`。签名取址、CENC 解密、JS 源都在手机上完成，不需要自己的服务器。
+
+- **下载**：GitHub Actions 的 `android` 工作流每次构建都会产出 APK（运行页 → Artifacts → `hongguo-android`）；打 `v*` 标签时还会挂到 Release。只打 `arm64-v8a`。
+- **手机模式**（`MOBILE=1`，App 自动设置）：没有账号系统，历史 / 收藏 / 追更 / 倍速存本机 `local-user.json`；顶栏「账号」变成「数据」，可「导出备份 / 导入备份」（导出到「下载」目录，导入是合并）。通道探针、Webhook、ffmpeg 转码关闭，所以没有 VVC 中间档，只有 1080P HEVC 与 360P H.264。「猜你喜欢」没有「同好也在看」。
+- **本机口令**：App 首次启动随机生成 `TOKEN`，只监听 `127.0.0.1`，手机上其它 App 调不到本地接口。
+- **签名**：在仓库 Secrets 里配 `ANDROID_KEYSTORE_BASE64`（keystore 的 base64）、`ANDROID_KEYSTORE_PASSWORD`、`ANDROID_KEY_ALIAS`、`ANDROID_KEY_PASSWORD` 后用正式签名；不配就用调试签名（已缓存，尽量保持不变）。**签名变了装新版要先卸载，本机数据会丢，卸载前先导出备份。**
+- **本地构建**：装好 JDK 17、Android SDK（NDK 27.2、CMake 3.22.1）后：
+
+  ```bash
+  (cd server && pnpm install --prod --frozen-lockfile --config.node-linker=hoisted)
+  android/scripts/fetch-libnode.sh
+  gradle -p android assembleRelease     # 产物：android/app/build/outputs/apk/release/
+  ```
+
+- **排查**：`adb logcat -s hongguo-node hongguo` 能看到 Node 的全部日志。
+
 ### 3.7 播放器快捷键
 
 | 按键 | 作用 |
