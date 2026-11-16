@@ -89,6 +89,8 @@ jobs:
           out="hongguo-${version}-${GITHUB_RUN_NUMBER}-arm64.apk"
           cp android/app/build/outputs/apk/release/app-release.apk "$out"
           ls -la "$out"
+          # 确认原生库和 Node 项目都打进去了（缺 libc++_shared.so / libnode.so 会一启动就闪退）
+          unzip -l "$out" | grep -E "lib/|assets/" 
           echo "file=$out" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v4

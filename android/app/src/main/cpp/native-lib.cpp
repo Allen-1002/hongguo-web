@@ -6,6 +6,8 @@
 #include <unistd.h>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
+#include <ctime>
 #include <string>
 #include <vector>
 
@@ -16,6 +18,8 @@ namespace {
 const char *kTag = "hongguo-node";
 int pipeStdout[2];
 int pipeStderr[2];
+int logFd = -1;  // 同时写一份到文件（HONGGUO_LOG_FILE），闪退后 App 下次启动能显示出来
+pthread_mutex_t logLock = PTHREAD_MUTEX_INITIALIZER;
 
 // Node 的 stdout / stderr 转进 logcat，方便用 `adb logcat -s hongguo-node` 排查。
 void *pumpPipe(void *arg) {
@@ -27,6 +31,12 @@ void *pumpPipe(void *arg) {
     if (buf[n - 1] == '\n') --n;
     buf[n] = 0;
     __android_log_write(prio, kTag, buf);
+    if (logFd >= 0) {
+      pthread_mutex_lock(&logLock);
+      write(logFd, buf, n);
+      write(logFd, "\n", 1);
+      pthread_mutex_unlock(&logLock);
+    }
   }
   return nullptr;
 }
@@ -80,8 +90,15 @@ Java_io_github_hongguoweb_app_NodeRunner_startNode(JNIEnv *env, jclass, jobjectA
     cursor += values[i].size() + 1;
   }
 
+  const char *logPath = getenv("HONGGUO_LOG_FILE");
+  if (logPath && *logPath) logFd = open(logPath, O_WRONLY | O_CREAT | O_APPEND, 0600);
   redirectStdio();
   int code = node::Start(argc, argv.data());
+  if (logFd >= 0) {
+    char line[64];
+    int len = snprintf(line, sizeof(line), "[node::Start 返回 %d]\n", code);
+    write(logFd, line, len);
+  }
   free(block);
   return code;
 }

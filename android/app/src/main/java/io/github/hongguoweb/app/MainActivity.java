@@ -66,6 +66,19 @@ public class MainActivity extends Activity {
         root.addView(splash, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         setContentView(root);
 
+        // 上次没能正常启动（闪退）：先把日志给用户看，再让用户选择继续。
+        CrashLog.install(this);
+        String report = CrashLog.beginLaunch(this);
+        if (report != null) {
+            showReport(report);
+            return;
+        }
+        boot();
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private void boot() {
+
         WebSettings s = web.getSettings();
         s.setJavaScriptEnabled(true);
         s.setDomStorageEnabled(true);
@@ -92,6 +105,7 @@ public class MainActivity extends Activity {
             @Override
             public void onPageFinished(WebView view, String url) {
                 splash.setVisibility(View.GONE);
+                CrashLog.launchOk(MainActivity.this);
             }
         });
 
@@ -150,6 +164,52 @@ public class MainActivity extends Activity {
                 }
             });
         }, "wait-node").start();
+    }
+
+    /** 诊断页：显示上次失败的日志，可复制，可继续启动。 */
+    private void showReport(String report) {
+        splash.setVisibility(View.GONE);
+        android.widget.LinearLayout box = new android.widget.LinearLayout(this);
+        box.setOrientation(android.widget.LinearLayout.VERTICAL);
+        box.setBackgroundColor(Color.BLACK);
+        int pad = (int) (16 * getResources().getDisplayMetrics().density);
+        box.setPadding(pad, pad * 2, pad, pad);
+
+        TextView title = new TextView(this);
+        title.setText("上次没有正常启动，下面是日志。请点「复制日志」发给开发者。");
+        title.setTextColor(Color.WHITE);
+        title.setTextSize(15);
+        box.addView(title);
+
+        android.widget.LinearLayout row = new android.widget.LinearLayout(this);
+        android.widget.Button copy = new android.widget.Button(this);
+        copy.setText("复制日志");
+        copy.setOnClickListener(v -> {
+            android.content.ClipboardManager cm = (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+            cm.setPrimaryClip(android.content.ClipData.newPlainText("hongguo log", report));
+            android.widget.Toast.makeText(this, "已复制", android.widget.Toast.LENGTH_SHORT).show();
+        });
+        android.widget.Button go = new android.widget.Button(this);
+        go.setText("继续启动");
+        go.setOnClickListener(v -> {
+            root.removeView(box);
+            splash.setVisibility(View.VISIBLE);
+            boot();
+        });
+        row.addView(copy);
+        row.addView(go);
+        box.addView(row);
+
+        android.widget.ScrollView scroll = new android.widget.ScrollView(this);
+        TextView body = new TextView(this);
+        body.setText(report);
+        body.setTextColor(Color.LTGRAY);
+        body.setTextSize(11);
+        body.setTypeface(android.graphics.Typeface.MONOSPACE);
+        body.setTextIsSelectable(true);
+        scroll.addView(body);
+        box.addView(scroll, new android.widget.LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+        root.addView(box, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
     }
 
     @Override

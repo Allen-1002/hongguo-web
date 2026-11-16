@@ -29,9 +29,19 @@ final class NodeRunner {
     private static volatile boolean started = false;
     private static volatile String failure = null;
 
+    /** 原生库加载失败时不让 App 直接崩，把原因显示出来。 */
+    private static final String loadError;
+
     static {
-        System.loadLibrary("node");
-        System.loadLibrary("native-lib");
+        String err = null;
+        try {
+            System.loadLibrary("node");
+            System.loadLibrary("native-lib");
+        } catch (Throwable e) {
+            err = "加载原生库失败：" + e;
+            Log.e(TAG, err, e);
+        }
+        loadError = err;
     }
 
     private static native int startNode(String[] args, String[] envs);
@@ -58,6 +68,7 @@ final class NodeRunner {
     static synchronized void ensureStarted(Context ctx) {
         if (started) return;
         started = true;
+        if (loadError != null) { failure = loadError; return; }
         final Context app = ctx.getApplicationContext();
         final String token = token(app);
         // Node/V8 主线程给足 16 MB 栈（默认线程栈太小，深递归的 JSON/正则会崩）。
@@ -69,6 +80,7 @@ final class NodeRunner {
                 String[] args = {"node", new File(project, "server/index.mjs").getAbsolutePath()};
                 String[] envs = {
                         "MOBILE=1",
+                        "HONGGUO_LOG_FILE=" + CrashLog.nodeLog(app).getAbsolutePath(),
                         "HOST=127.0.0.1",
                         "PORT=" + PORT,
                         "TOKEN=" + token,

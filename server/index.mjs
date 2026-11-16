@@ -123,6 +123,8 @@ process.on("uncaughtException", (error) => {
     message: String((error && error.message) || error),
     stack: String((error && error.stack) || "").slice(0, 2000),
   }));
+  // 手机模式：Node 和 App 同一个进程，process.exit 会让整个 App 闪退，只记日志继续跑。
+  if (MOBILE) return;
   try { shutdown("uncaught_exception"); } catch { process.exit(1); }
 });
 
